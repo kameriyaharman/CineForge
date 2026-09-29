@@ -80,14 +80,27 @@ interface GenerateVideoRequest {
   characterId: string;
 }
 
-interface GenerateVideoSuccess {
+/** 202 from POST /api/generate-video — the render is queued at Fal. */
+interface GenerateVideoAccepted {
+  clipId: string;
   requestId: string;
-  videoUrl: string;
-  contentType: string;
-  fileSize?: number;
-  seed: number;
+  status: "IN_QUEUE";
+  statusUrl: string;
   finalPrompt: string;
-  cameraMovement: CameraMovement | null;
+}
+
+type ClipPhase = "IN_QUEUE" | "RENDERING" | "UPSCALING" | "COMPLETED" | "FAILED";
+
+/** GET /api/generate-video/{clipId} */
+interface ClipStatusResponse {
+  clipId: string;
+  status: ClipPhase;
+  queuePosition?: number;
+  videoUrl?: string;
+  seed?: number;
+  finalPrompt: string;
+  error?: string;
+  note?: string;
 }
 
 interface ApiErrorResponse {
@@ -97,7 +110,7 @@ interface ApiErrorResponse {
 }
 
 interface RenderMeta {
-  seed: number;
+  seed?: number;
   finalPrompt: string;
   elapsedMs: number;
   characterName: string;
@@ -176,12 +189,53 @@ function isApiError(value: unknown): value is ApiErrorResponse {
   );
 }
 
-function isGenerateVideoSuccess(value: unknown): value is GenerateVideoSuccess {
+function isGenerateVideoAccepted(value: unknown): value is GenerateVideoAccepted {
   return (
     typeof value === "object" &&
     value !== null &&
-    typeof (value as { videoUrl?: unknown }).videoUrl === "string"
+    typeof (value as { clipId?: unknown }).clipId === "string" &&
+    typeof (value as { statusUrl?: unknown }).statusUrl === "string"
   );
+}
+
+function isClipStatus(value: unknown): value is ClipStatusResponse {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { clipId?: unknown }).clipId === "string" &&
+    typeof (value as { status?: unknown }).status === "string"
+  );
+}
+
+const STATUS_POLL_MS = 4000;
+const MAX_POLL_FAILURES = 6;
+
+const sleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+
+function phaseCaption(phase: ClipPhase | null, queuePosition: number | null): string {
+  switch (phase) {
+    case "IN_QUEUE":
+      return queuePosition !== null && queuePosition > 0
+        ? `Waiting in the render queue · position ${queuePosition + 1}`
+        : "Waiting for a render slot…";
+    case "RENDERING":
+      return "Rendering frames…";
+    case "UPSCALING":
+      return "Upscaling to 2K…";
+    default:
+      return "Sending to the render engine…";
+  }
 }
 
 function isSoulCharacter(value: unknown): value is SoulCharacter {
@@ -198,7 +252,11 @@ async function readJson(res: Response): Promise<unknown> {
   try {
     return await res.json();
   } catch {
-    return { error: `Unexpected response (${res.status}).`, code: "BAD_RESPONSE" };
+    const message =
+      res.status === 502 || res.status === 503 || res.status === 504
+        ? "The server is unreachable or restarting. Try again in a minute."
+        : `Unexpected response (${res.status}).`;
+    return { error: message, code: "BAD_RESPONSE" };
   }
 }
 
@@ -216,7 +274,10 @@ export default function CineForgeStudioPage() {
   const [meta, setMeta] = useState<RenderMeta | null>(null);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState<number>(() => Date.now());
+  const [phase, setPhase] = useState<ClipPhase | null>(null);
+  const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const renderAbortRef = useRef<AbortController | null>(null);
+  const activeClipIdRef = useRef<string | null>(null);
 
   /* ----------------------------- Soul ID state ----------------------------- */
   const [characters, setCharacters] = useState<SoulCharacter[]>([]);
@@ -358,33 +419,85 @@ export default function CineForgeStudioPage() {
         characterId: lockedCharacter.id,
       };
 
+      setPhase(null);
+      setQueuePosition(null);
+      activeClipIdRef.current = null;
+
       try {
+        // 1. Submit — returns in about a second with a clip id.
         const response = await fetch("/api/generate-video", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
-        const data = await readJson(response);
-
-        if (!response.ok || isApiError(data)) {
+        const accepted = await readJson(response);
+        if (!response.ok || isApiError(accepted)) {
           throw new Error(
-            isApiError(data) ? data.error : `Render failed (${response.status}).`,
+            isApiError(accepted) ? accepted.error : `Render failed (${response.status}).`,
           );
         }
-        if (!isGenerateVideoSuccess(data)) {
-          throw new Error("The render finished without a video URL.");
+        if (!isGenerateVideoAccepted(accepted)) {
+          throw new Error("The server returned an unexpected response.");
         }
+        activeClipIdRef.current = accepted.clipId;
+        setPhase("IN_QUEUE");
 
-        setVideoUrl(data.videoUrl);
-        setMeta({
-          seed: data.seed,
-          finalPrompt: data.finalPrompt,
-          elapsedMs: Date.now() - began,
-          characterName: lockedCharacter.characterName,
-          cameraMovement: lockedCamera,
-        });
-        notify("success", "Sequence rendered", `${lockedCharacter.characterName} · ${lockedCamera}`);
+        // 2. Poll until the video is ready or the render fails.
+        let failures = 0;
+        for (;;) {
+          await sleep(STATUS_POLL_MS, controller.signal);
+
+          let status: unknown;
+          let ok = false;
+          try {
+            const res = await fetch(accepted.statusUrl, {
+              cache: "no-store",
+              signal: controller.signal,
+            });
+            ok = res.ok;
+            status = await readJson(res);
+          } catch (err) {
+            if (err instanceof DOMException && err.name === "AbortError") throw err;
+            status = null;
+          }
+
+          if (!ok || !isClipStatus(status)) {
+            failures += 1;
+            if (failures >= MAX_POLL_FAILURES) {
+              throw new Error(
+                isApiError(status) ? status.error : "Lost contact with the render server.",
+              );
+            }
+            continue;
+          }
+          failures = 0;
+          setPhase(status.status);
+          setQueuePosition(status.queuePosition ?? null);
+
+          if (status.status === "FAILED") {
+            throw new Error(status.error ?? "The render failed.");
+          }
+
+          if ((status.status === "COMPLETED" || status.status === "UPSCALING") && status.videoUrl) {
+            setVideoUrl(status.videoUrl);
+            setMeta({
+              seed: status.seed,
+              finalPrompt: status.finalPrompt,
+              elapsedMs: Date.now() - began,
+              characterName: lockedCharacter.characterName,
+              cameraMovement: lockedCamera,
+            });
+            notify(
+              "success",
+              "Sequence rendered",
+              status.status === "UPSCALING"
+                ? "Showing the raw render; the 2K master is upscaling in the background."
+                : `${lockedCharacter.characterName} · ${lockedCamera}`,
+            );
+            break;
+          }
+        }
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") {
           setError("Render cancelled.");
@@ -395,6 +508,9 @@ export default function CineForgeStudioPage() {
         }
       } finally {
         if (renderAbortRef.current === controller) renderAbortRef.current = null;
+        activeClipIdRef.current = null;
+        setPhase(null);
+        setQueuePosition(null);
         setLoading(false);
       }
     },
@@ -402,7 +518,12 @@ export default function CineForgeStudioPage() {
   );
 
   const handleCancel = useCallback(() => {
+    const clipId = activeClipIdRef.current;
     renderAbortRef.current?.abort();
+    if (clipId) {
+      // Stop the Fal job too, so an abandoned render isn't billed.
+      void fetch(`/api/generate-video/${clipId}`, { method: "DELETE" }).catch(() => undefined);
+    }
   }, []);
 
   const handleReset = useCallback(() => {
@@ -674,6 +795,7 @@ export default function CineForgeStudioPage() {
                 elapsed={elapsedLabel}
                 camera={cameraMovement}
                 characterName={activeCharacter?.characterName ?? null}
+                caption={phaseCaption(phase, queuePosition)}
               />
             ) : error ? (
               <ErrorState message={error} onReset={handleReset} />
@@ -715,7 +837,7 @@ export default function CineForgeStudioPage() {
                 </div>
                 <div className="flex gap-1.5">
                   <dt className="text-slate-500">Seed</dt>
-                  <dd className="font-mono tabular-nums text-slate-200">{meta.seed}</dd>
+                  <dd className="font-mono tabular-nums text-slate-200">{meta.seed ?? "—"}</dd>
                 </div>
               </dl>
               <div className="flex gap-2">
@@ -1443,10 +1565,12 @@ function RenderingPlaceholder({
   elapsed,
   camera,
   characterName,
+  caption,
 }: {
   elapsed: string;
   camera: CameraMovement;
   characterName: string | null;
+  caption: string;
 }) {
   return (
     <div
@@ -1482,6 +1606,7 @@ function RenderingPlaceholder({
           <p className="animate-pulse text-sm font-medium text-slate-100 sm:text-base">
             🎬 CineForge AI Engine Rendering Clip (Approx 60s)...
           </p>
+          <p className="mt-2 text-xs text-indigo-200/90">{caption}</p>
           <p className="mt-2 font-mono text-[11px] tracking-widest text-slate-500">
             {characterName ? `${characterName.toUpperCase()} · ` : ""}
             {camera} · ELAPSED {elapsed}

@@ -1,14 +1,15 @@
-import { ApiError, ValidationError, fal } from "@fal-ai/client";
+import { ApiError, ValidationError } from "@fal-ai/client";
 import { NextResponse, type NextRequest } from "next/server";
 import { Prisma } from "@/lib/generated/prisma/client";
-import {
-  MagnificError,
-  getVideoUpscaleTask,
-  isMagnificConfigured,
-  submitVideoUpscale,
-  type MagnificVideoUpscaleInput,
-} from "@/lib/magnific";
 import { prisma } from "@/lib/prisma";
+import {
+  FalNotConfiguredError,
+  HUNYUAN_T2V_ENDPOINT,
+  getFal,
+  isFalConfigured,
+  markClipFailed,
+  type HunyuanVideoInput,
+} from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
 
 /* -------------------------------------------------------------------------- */
@@ -17,45 +18,14 @@ import { verifySession } from "@/lib/session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Honoured on Vercel-style hosts; Railway keeps the connection open without it.
-export const maxDuration = 800;
 
-const HUNYUAN_T2V_ENDPOINT = "fal-ai/hunyuan-video";
 const PROMPT_MIN_LENGTH = 10;
 const PROMPT_MAX_LENGTH = 2000;
-const POLL_INTERVAL_MS = 3000;
-/** Give up if Fal hasn't started the job within 5 minutes (queue backlog). */
-const START_TIMEOUT_SECONDS = 300;
 /** Default project that clips land in when the client doesn't pick one. */
 const DEFAULT_PROJECT_TITLE = "Studio Sessions";
 
-/**
- * Magnific upscale settings for delivery masters.
- *  - resolution "2k": Magnific takes a target resolution, not a multiplier.
- *    Hunyuan outputs ~1024x576, so 2x lands at ~2K. Use "4k" for true 4K
- *    (Magnific bills per frame, and 4K costs more per frame).
- *  - creativity 3 (of 0–100): very low, so faces and Soul ID identity are not
- *    re-invented by the upscaler.
- *  - The video upscaler has no HDR control; `flavor: "vivid"` is the closest
- *    contrast/colour option and is also the API default.
- */
-const UPSCALE_SETTINGS = {
-  resolution: "2k",
-  creativity: 3,
-  flavor: "vivid",
-  output_format: "h264",
-} as const satisfies Omit<MagnificVideoUpscaleInput, "video">;
-const UPSCALE_POLL_INTERVAL_MS = 10_000;
-const UPSCALE_MAX_WAIT_MS = 30 * 60 * 1000;
-const UPSCALE_MAX_POLL_FAILURES = 6;
-
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-const falKey = process.env.FAL_KEY;
-if (falKey) {
-  fal.config({ credentials: falKey });
-}
 
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
@@ -82,29 +52,6 @@ interface GenerateVideoBody {
   projectId: string | null;
 }
 
-/** Input schema for fal-ai/hunyuan-video (text-to-video). */
-interface HunyuanVideoInput {
-  prompt: string;
-  seed?: number;
-  pro_mode?: boolean;
-  aspect_ratio?: "16:9" | "9:16";
-  resolution?: "480p" | "580p" | "720p";
-  num_frames?: 129 | 85;
-  enable_safety_checker?: boolean;
-}
-
-interface FalFile {
-  url: string;
-  content_type?: string;
-  file_name?: string;
-  file_size?: number;
-}
-
-interface HunyuanVideoOutput {
-  video: FalFile;
-  seed: number;
-}
-
 /** The character data this route needs from the database. */
 interface CharacterReference {
   id: string;
@@ -124,25 +71,17 @@ interface IdentityPlan {
   note: string;
 }
 
-interface GenerateVideoSuccess {
+interface GenerateVideoAccepted {
   clipId: string;
   projectId: string;
-  /** false if the video rendered but the COMPLETED write to the database failed. */
-  persisted: boolean;
   requestId: string;
-  videoUrl: string;
-  contentType: string;
-  fileSize?: number;
-  seed: number;
+  status: "IN_QUEUE";
+  /** Poll this for progress and the final video. */
+  statusUrl: string;
   finalPrompt: string;
   cameraMovement: CameraMovement | null;
   character: { id: string; characterName: string } | null;
   identityMode: IdentityPlan["mode"];
-  upscale: {
-    status: "QUEUED" | "SKIPPED";
-    resolution: string | null;
-    reason?: string;
-  };
 }
 
 interface GenerateVideoError {
@@ -321,16 +260,6 @@ function buildFinalPrompt(
   return `${withPunctuation} ${tags.join(" ")}`;
 }
 
-function isHunyuanOutput(data: unknown): data is HunyuanVideoOutput {
-  if (typeof data !== "object" || data === null) return false;
-  const video = (data as { video?: unknown }).video;
-  return (
-    typeof video === "object" &&
-    video !== null &&
-    typeof (video as { url?: unknown }).url === "string"
-  );
-}
-
 /** Uses the requested project if the user owns it, otherwise their default project. */
 async function resolveProjectId(userId: string, requested: string | null): Promise<string | null> {
   if (requested) {
@@ -357,119 +286,6 @@ async function resolveProjectId(userId: string, requested: string | null): Promi
   return created.id;
 }
 
-/** Best-effort status write; a DB hiccup here must not mask the real error. */
-async function markClipFailed(clipId: string, message: string): Promise<void> {
-  try {
-    await prisma.videoClip.update({
-      where: { id: clipId },
-      data: { status: "FAILED", errorMessage: message.slice(0, 2000) },
-    });
-  } catch (err) {
-    console.error(`[generate-video] Could not mark clip ${clipId} FAILED:`, err);
-  }
-}
-
-/* --------------------- Step C: Magnific upscale sweep --------------------- */
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-/** Upscale unavailable or failed: the raw master is still deliverable. */
-async function completeWithoutUpscale(clipId: string, reason: string): Promise<void> {
-  try {
-    await prisma.videoClip.update({
-      where: { id: clipId },
-      data: { status: "COMPLETED", errorMessage: `Upscale skipped: ${reason}`.slice(0, 2000) },
-    });
-    console.warn(`[upscale] clip ${clipId} COMPLETED without upscale — ${reason}`);
-  } catch (err) {
-    console.error(`[upscale] clip ${clipId} could not be finalised:`, err);
-  }
-}
-
-/**
- * Runs after the response has been sent. Submits the raw Fal video to Magnific,
- * polls until done, then writes `upscaledVideoUrl` and flips the clip to
- * COMPLETED. Never throws.
- *
- * Runs inside the long-lived Railway Node process. A redeploy mid-upscale
- * leaves the clip in PROCESSING with its raw video saved; a Magnific
- * `webhook_url` route is the durable replacement for this poller.
- */
-async function runUpscaleSweep(clipId: string, rawVideoUrl: string): Promise<void> {
-  let taskId: string;
-  try {
-    const task = await submitVideoUpscale({ video: rawVideoUrl, ...UPSCALE_SETTINGS });
-    taskId = task.taskId;
-    console.info(
-      `[upscale] clip ${clipId} → Magnific task ${taskId} (${UPSCALE_SETTINGS.resolution}, creativity ${UPSCALE_SETTINGS.creativity})`,
-    );
-  } catch (err) {
-    const detail =
-      err instanceof MagnificError
-        ? `${err.message}${err.body ? ` ${JSON.stringify(err.body).slice(0, 300)}` : ""}`
-        : String(err);
-    console.error(`[upscale] clip ${clipId} submit failed:`, detail);
-    await completeWithoutUpscale(clipId, "Magnific rejected the upscale request.");
-    return;
-  }
-
-  const deadline = Date.now() + UPSCALE_MAX_WAIT_MS;
-  let consecutiveFailures = 0;
-
-  while (Date.now() < deadline) {
-    await sleep(UPSCALE_POLL_INTERVAL_MS);
-
-    let task;
-    try {
-      task = await getVideoUpscaleTask(taskId);
-      consecutiveFailures = 0;
-    } catch (err) {
-      consecutiveFailures += 1;
-      console.warn(
-        `[upscale] clip ${clipId} poll ${consecutiveFailures}/${UPSCALE_MAX_POLL_FAILURES} failed:`,
-        err instanceof Error ? err.message : err,
-      );
-      if (consecutiveFailures >= UPSCALE_MAX_POLL_FAILURES) {
-        await completeWithoutUpscale(clipId, `lost contact with Magnific task ${taskId}.`);
-        return;
-      }
-      continue;
-    }
-
-    if (task.status === "COMPLETED") {
-      const upscaledUrl = task.generated[0];
-      if (!upscaledUrl) {
-        await completeWithoutUpscale(clipId, `Magnific task ${taskId} returned no file.`);
-        return;
-      }
-      try {
-        await prisma.videoClip.update({
-          where: { id: clipId },
-          data: { status: "COMPLETED", upscaledVideoUrl: upscaledUrl, errorMessage: null },
-        });
-        console.info(
-          `[upscale] clip ${clipId} COMPLETED`,
-          JSON.stringify({ taskId, upscaledVideoUrl: upscaledUrl }),
-        );
-      } catch (err) {
-        console.error(
-          `[upscale] clip ${clipId} upscaled but DB write failed — recover manually:`,
-          JSON.stringify({ taskId, upscaledVideoUrl: upscaledUrl }),
-          err,
-        );
-      }
-      return;
-    }
-
-    if (task.status === "FAILED") {
-      await completeWithoutUpscale(clipId, `Magnific task ${taskId} failed.`);
-      return;
-    }
-  }
-
-  await completeWithoutUpscale(clipId, `Magnific task ${taskId} timed out after 30 minutes.`);
-}
-
 /* -------------------------------------------------------------------------- */
 /*                                    Route                                   */
 /* -------------------------------------------------------------------------- */
@@ -478,19 +294,21 @@ async function runUpscaleSweep(clipId: string, rawVideoUrl: string): Promise<voi
  * POST /api/generate-video
  * Body: { prompt, cameraMovement?, activeCharacterId?, projectId? }
  *
- *   400  invalid body
- *   401  no / invalid / expired session      403  (reserved: userId mismatch)
+ * Submits the render to Fal's queue and returns immediately (Railway closes
+ * requests after 5 minutes; renders can take longer). The client then polls
+ * GET /api/generate-video/{clipId}, which also finalises the clip and starts
+ * the Magnific upscale when Fal finishes.
+ *
+ *   202  { clipId, requestId, status: "IN_QUEUE", statusUrl, ... }
+ *   400  invalid body          401  no / invalid / expired session
  *   404  character or project not found for this user
- *   200  { clipId, videoUrl (raw), upscale }  — row PROCESSING while Magnific
- *        upscales, then COMPLETED with upscaledVideoUrl (or COMPLETED directly
- *        when MAGNIFIC_API_KEY is not set)
- *   4xx/5xx from the provider — VideoClip row FAILED with errorMessage
+ *   4xx/5xx from Fal — clip marked FAILED with errorMessage
  */
 export async function POST(
   req: NextRequest,
-): Promise<NextResponse<GenerateVideoSuccess | GenerateVideoError>> {
-  if (!falKey) {
-    console.error("[generate-video] FAL_KEY is not set.");
+): Promise<NextResponse<GenerateVideoAccepted | GenerateVideoError>> {
+  if (!isFalConfigured()) {
+    console.error("[generate-video] FAL_KEY is not set in this deployment's environment.");
     return errorResponse(500, "SERVER_MISCONFIGURED", "Video engine is not configured.");
   }
 
@@ -568,10 +386,6 @@ export async function POST(
     return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");
   }
 
-  console.info(
-    `[generate-video] clip ${clipId} PROCESSING · character=${character?.characterName ?? "none"} · identity=${identity.mode} · ${identity.note}`,
-  );
-
   // Hunyuan on Fal takes aspect_ratio + resolution, not pixel dimensions.
   // 16:9 at 580p is the closest supported preset to 1024x576.
   const input: HunyuanVideoInput = {
@@ -582,137 +396,39 @@ export async function POST(
     enable_safety_checker: true,
   };
 
-  let requestId: string | null = null;
-
-  // Client disconnected → cancel the Fal job so it isn't billed.
-  const onClientAbort = () => {
-    if (requestId) {
-      fal.queue.cancel(HUNYUAN_T2V_ENDPOINT, { requestId }).catch((err: unknown) => {
-        console.warn(`[generate-video] cancel failed for ${requestId}:`, err);
-      });
-    }
-  };
-  req.signal.addEventListener("abort", onClientAbort, { once: true });
-
-  // 4. Render + status tracking.
+  // 4. Submit to Fal's queue — returns in about a second.
   try {
-    const result = await fal.subscribe(HUNYUAN_T2V_ENDPOINT, {
-      input,
-      mode: "polling",
-      pollInterval: POLL_INTERVAL_MS,
-      startTimeout: START_TIMEOUT_SECONDS,
-      abortSignal: req.signal,
-      logs: false,
-      onEnqueue: (id: string) => {
-        requestId = id;
-        // Store the Fal job id immediately so a webhook or support ticket can find this clip.
-        prisma.videoClip
-          .update({ where: { id: clipId }, data: { providerRequestId: id } })
-          .catch((err: unknown) =>
-            console.error(`[generate-video] Could not store request id on clip ${clipId}:`, err),
-          );
-      },
-      onQueueUpdate: (update) => {
-        if (update.status === "IN_QUEUE") {
-          console.info(
-            `[generate-video] clip ${clipId} queued at position ${update.queue_position}`,
-          );
-        }
-      },
+    const { request_id: requestId } = await getFal().queue.submit(HUNYUAN_T2V_ENDPOINT, { input });
+
+    await prisma.videoClip.update({
+      where: { id: clipId },
+      data: { providerRequestId: requestId },
     });
 
-    if (!isHunyuanOutput(result.data)) {
-      console.error("[generate-video] Unexpected output shape:", result.data);
-      await markClipFailed(clipId, "Provider returned no video.");
-      return errorResponse(502, "INVALID_PROVIDER_OUTPUT", "The render finished but returned no video.");
-    }
-
-    const { video, seed } = result.data;
-    // Prefer the id from onEnqueue; never overwrite it with an empty value.
-    const finalRequestId = result.requestId || requestId || "";
-
-    // The video exists and has been paid for — a failed bookkeeping write must
-    // not turn that into an error for the user. Log everything needed to recover.
-    // With Magnific configured, the clip stays PROCESSING until the upscale
-    // sweep writes upscaledVideoUrl; otherwise the raw master completes it.
-    const upscaleEnabled = isMagnificConfigured();
-    let persisted = true;
-    try {
-      await prisma.videoClip.update({
-        where: { id: clipId },
-        data: {
-          status: upscaleEnabled ? "PROCESSING" : "COMPLETED",
-          rawVideoUrl: video.url,
-          seed: Number.isSafeInteger(seed) && Math.abs(seed) <= 2_147_483_647 ? seed : null,
-          ...(finalRequestId ? { providerRequestId: finalRequestId } : {}),
-          errorMessage: null,
-        },
-      });
-    } catch (dbErr) {
-      persisted = false;
-      console.error(
-        `[generate-video] clip ${clipId} rendered but COMPLETED write failed — recover manually:`,
-        JSON.stringify({ clipId, requestId: finalRequestId, videoUrl: video.url, seed }),
-        dbErr,
-      );
-    }
-
-    // Step C — fire-and-forget upscale. The user gets the raw clip now; the
-    // 2K master lands in the database when Magnific finishes.
-    if (upscaleEnabled && persisted) {
-      void runUpscaleSweep(clipId, video.url).catch((err: unknown) =>
-        console.error(`[upscale] clip ${clipId} sweep crashed:`, err),
-      );
-    } else if (!upscaleEnabled) {
-      console.warn("[generate-video] MAGNIFIC_API_KEY not set — skipping upscale.");
-    }
-
     console.info(
-      `[generate-video] clip ${clipId} ${
-        !persisted ? "RENDERED (not persisted)" : upscaleEnabled ? "RAW READY → UPSCALING" : "COMPLETED"
-      }`,
-      JSON.stringify({
-        requestId: finalRequestId,
-        videoUrl: video.url,
-        contentType: video.content_type,
-        fileSize: video.file_size,
-        seed,
-      }),
+      `[generate-video] clip ${clipId} submitted as Fal ${requestId} · character=${character?.characterName ?? "none"} · identity=${identity.mode}`,
     );
 
     return NextResponse.json(
       {
         clipId,
         projectId,
-        persisted,
-        requestId: finalRequestId,
-        videoUrl: video.url,
-        contentType: video.content_type ?? "video/mp4",
-        fileSize: video.file_size,
-        seed,
+        requestId,
+        status: "IN_QUEUE",
+        statusUrl: `/api/generate-video/${clipId}`,
         finalPrompt,
         cameraMovement,
         character: character
           ? { id: character.id, characterName: character.characterName }
           : null,
         identityMode: identity.mode,
-        upscale:
-          upscaleEnabled && persisted
-            ? { status: "QUEUED", resolution: UPSCALE_SETTINGS.resolution }
-            : {
-                status: "SKIPPED",
-                resolution: null,
-                reason: !upscaleEnabled
-                  ? "Upscaler not configured."
-                  : "Clip record could not be saved.",
-              },
       },
-      { status: 200, headers: { "Cache-Control": "no-store" } },
+      { status: 202, headers: { "Cache-Control": "no-store" } },
     );
   } catch (err) {
-    if (req.signal.aborted || (err instanceof Error && err.name === "AbortError")) {
-      await markClipFailed(clipId, "Cancelled by client.");
-      return errorResponse(499, "CLIENT_CLOSED_REQUEST", "Request was cancelled.");
+    if (err instanceof FalNotConfiguredError) {
+      await markClipFailed(clipId, "FAL_KEY is not set.");
+      return errorResponse(500, "SERVER_MISCONFIGURED", "Video engine is not configured.");
     }
 
     if (err instanceof ValidationError) {
@@ -726,18 +442,17 @@ export async function POST(
     }
 
     if (err instanceof ApiError) {
-      console.error(`[generate-video] Fal API error ${err.status}:`, err.body);
-      await markClipFailed(clipId, `Fal API error ${err.status}.`);
+      console.error(`[generate-video] Fal submit error ${err.status}:`, err.body);
+      await markClipFailed(clipId, `Fal submit error ${err.status}.`);
       switch (err.status) {
         case 401:
         case 403:
-          return errorResponse(502, "PROVIDER_AUTH_FAILED", "Video engine authentication failed.");
-        case 408:
-        case 504:
+          return errorResponse(502, "PROVIDER_AUTH_FAILED", "Video engine rejected the API key.");
+        case 402:
           return errorResponse(
-            504,
-            "PROVIDER_TIMEOUT",
-            "The render queue is busy and the job did not start in time. Please retry.",
+            402,
+            "PROVIDER_PAYMENT_REQUIRED",
+            "The Fal account has no credit. Top up at fal.ai and retry.",
           );
         case 429:
           return errorResponse(
@@ -748,15 +463,12 @@ export async function POST(
         default:
           return errorResponse(502, "PROVIDER_ERROR", "The video engine returned an error.", {
             clipId,
-            requestId,
           });
       }
     }
 
-    console.error("[generate-video] Unexpected error:", err);
+    console.error("[generate-video] Unexpected submit error:", err);
     await markClipFailed(clipId, err instanceof Error ? err.message : "Unexpected error.");
     return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.", { clipId });
-  } finally {
-    req.signal.removeEventListener("abort", onClientAbort);
   }
 }
