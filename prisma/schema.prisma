@@ -1,0 +1,110 @@
+// CineForge — PostgreSQL schema (Prisma ORM 7)
+// Connection URL lives in prisma.config.ts (Prisma 7 no longer reads it from here).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------- Enums ----------------------------------
+
+enum ClipStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// Lifecycle of the Soul ID face embedding extracted via IP-Adapter-FaceID.
+enum FaceIdStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+// ---------------------------------- Models ----------------------------------
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  email     String   @unique @db.VarChar(320)
+  name      String?  @db.VarChar(120)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  characters Character[]
+  projects   Project[]
+
+  @@map("users")
+}
+
+/// A "Soul ID" hero character: the reference sheet used to keep a face
+/// consistent across every clip it appears in.
+model Character {
+  id                 String       @id @default(uuid()) @db.Uuid
+  userId             String       @map("user_id") @db.Uuid
+  characterName      String       @map("character_name") @db.VarChar(80)
+  referenceImageUrl  String       @map("reference_image_url") @db.Text
+  /// Content type, byte size, host etc. captured at registration.
+  referenceImageMeta Json?        @map("reference_image_meta")
+  /// Face embedding(s) returned by IP-Adapter-FaceID. Null until extracted.
+  faceIdVectors      Json?        @map("face_id_vectors")
+  faceIdStatus       FaceIdStatus @default(PENDING) @map("face_id_status")
+  /// Pinned Replicate model version used to produce faceIdVectors.
+  faceIdModelVersion String?      @map("face_id_model_version") @db.VarChar(128)
+  faceIdError        String?      @map("face_id_error") @db.Text
+  createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  videoClips VideoClip[]
+
+  @@unique([userId, characterName])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("characters")
+}
+
+model Project {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  title       String   @db.VarChar(160)
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  videoClips VideoClip[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("projects")
+}
+
+model VideoClip {
+  id                String     @id @default(uuid()) @db.Uuid
+  projectId         String     @map("project_id") @db.Uuid
+  /// Optional: a clip can be rendered without a Soul ID character.
+  characterId       String?    @map("character_id") @db.Uuid
+  prompt            String     @db.Text
+  cameraMovement    String?    @map("camera_movement") @db.VarChar(40)
+  rawVideoUrl       String?    @map("raw_video_url") @db.Text
+  upscaledVideoUrl  String?    @map("upscaled_video_url") @db.Text
+  status            ClipStatus @default(PENDING)
+  /// Fal / Replicate job id, used to match incoming webhooks to this row.
+  providerRequestId String?    @unique @map("provider_request_id") @db.VarChar(128)
+  seed              Int?
+  errorMessage      String?    @map("error_message") @db.Text
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  character Character? @relation(fields: [characterId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, createdAt(sort: Desc)])
+  @@index([characterId])
+  @@index([status])
+  @@map("video_clips")
+}
