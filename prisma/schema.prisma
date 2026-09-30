@@ -89,7 +89,7 @@ model Character {
   triggerWord        String?      @map("trigger_word") @db.VarChar(40)
   /// Trained LoRA weights, copied into our bucket.
   loraKey            String?      @map("lora_key") @db.Text
-  trainingRequestId  String?      @unique @map("training_request_id") @db.VarChar(128)
+  trainingRequestId  String?      @map("training_request_id") @db.VarChar(128)
   trainingError      String?      @map("training_error") @db.Text
   trainingStartedAt  DateTime?    @map("training_started_at") @db.Timestamptz(3)
   trainingFinishedAt DateTime?    @map("training_finished_at") @db.Timestamptz(3)
@@ -104,6 +104,7 @@ model Character {
 
   @@unique([userId, characterName])
   @@index([userId, createdAt(sort: Desc)])
+  @@index([trainingRequestId])
   @@map("characters")
 }
 
