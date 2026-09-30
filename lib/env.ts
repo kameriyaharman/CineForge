@@ -39,6 +39,7 @@ const REQUIRED: EnvRule[] = [
 
 const OPTIONAL: EnvRule[] = [
   { name: "MAGNIFIC_API_KEY", reason: "4K upscale — without it clips are delivered as the raw render" },
+  { name: "S3_BUCKET", reason: "asset library storage — without it renders keep only expiring provider links" },
   {
     name: "REPLICATE_API_TOKEN",
     reason: "Soul ID face step (IP-Adapter-FaceID) — not wired yet, so nothing uses it today",

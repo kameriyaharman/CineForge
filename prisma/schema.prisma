@@ -19,6 +19,19 @@ enum ClipStatus {
   FAILED
 }
 
+enum AssetKind {
+  IMAGE
+  VIDEO
+}
+
+/// Where an asset came from in the pipeline.
+enum AssetRole {
+  RENDER
+  UPSCALE
+  IMAGE
+  UPLOAD
+}
+
 /// Lifecycle of the Soul ID face embedding extracted via IP-Adapter-FaceID.
 enum FaceIdStatus {
   PENDING
@@ -38,6 +51,7 @@ model User {
 
   characters Character[]
   projects   Project[]
+  assets     Asset[]
 
   @@map("users")
 }
@@ -106,9 +120,36 @@ model VideoClip {
 
   project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   character Character? @relation(fields: [characterId], references: [id], onDelete: SetNull)
+  assets    Asset[]
 
   @@index([projectId, createdAt(sort: Desc)])
   @@index([characterId])
   @@index([status])
   @@map("video_clips")
+}
+
+/// A file kept permanently in the CineForge bucket (provider links expire).
+model Asset {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  /// The render this file belongs to, if any.
+  clipId      String?   @map("clip_id") @db.Uuid
+  kind        AssetKind
+  role        AssetRole
+  storageKey  String    @unique @map("storage_key") @db.Text
+  contentType String    @map("content_type") @db.VarChar(100)
+  byteSize    BigInt?   @map("byte_size")
+  /// Provider URL the file was copied from.
+  sourceUrl   String?   @map("source_url") @db.Text
+  prompt      String?   @db.Text
+  /// Settings used to make it (resolution, frames, aspect ratio, model…).
+  meta        Json?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clip VideoClip? @relation(fields: [clipId], references: [id], onDelete: SetNull)
+
+  @@unique([clipId, role])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("assets")
 }

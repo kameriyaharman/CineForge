@@ -1,5 +1,6 @@
 import { ApiError } from "@fal-ai/client";
 import { NextResponse, type NextRequest } from "next/server";
+import { assetUrl } from "@/lib/assets";
 import { isMagnificConfigured } from "@/lib/magnific";
 import { prisma } from "@/lib/prisma";
 import {
@@ -70,10 +71,31 @@ const clipSelect = {
   createdAt: true,
   updatedAt: true,
   character: { select: { characterName: true } },
+  assets: { select: { role: true, storageKey: true } },
 } as const;
 
 function errorResponse(status: number, code: string, error: string): NextResponse<ApiErrorBody> {
   return NextResponse.json({ error, code }, { status, headers: { "Cache-Control": "no-store" } });
+}
+
+/**
+ * Sends the status, swapping provider links for our own permanent copies when
+ * they've been archived (Fal/Magnific links expire; bucket copies don't).
+ */
+async function respond(clip: OwnedClip, body: ClipStatusResponse): Promise<NextResponse<ClipStatusResponse>> {
+  const rawKey = clip.assets.find((a) => a.role === "RENDER")?.storageKey;
+  const upKey = clip.assets.find((a) => a.role === "UPSCALE")?.storageKey;
+  const [raw, up] = await Promise.all([
+    rawKey ? assetUrl(rawKey) : Promise.resolve(null),
+    upKey ? assetUrl(upKey) : Promise.resolve(null),
+  ]);
+  const next = { ...body };
+  if (raw && next.rawVideoUrl) next.rawVideoUrl = raw;
+  if (up && next.upscaledVideoUrl) next.upscaledVideoUrl = up;
+  if (next.videoUrl) {
+    next.videoUrl = next.status === "COMPLETED" && clip.upscaledVideoUrl ? (up ?? next.videoUrl) : (raw ?? next.videoUrl);
+  }
+  return ok(next);
 }
 
 function ok(body: ClipStatusResponse): NextResponse<ClipStatusResponse> {
@@ -155,16 +177,16 @@ export async function GET(
   }
 
   // Finished (or failed) — answer from the database.
-  if (clip.status !== "PROCESSING") return ok(describe(clip));
+  if (clip.status !== "PROCESSING") return respond(clip, describe(clip));
 
   // Raw video saved; Magnific upscale in progress.
   if (clip.rawVideoUrl) {
     if (Date.now() - clip.updatedAt.getTime() > UPSCALE_STALE_MS) {
       await completeWithoutUpscale(clip.id, "the upscale was interrupted (server restarted).");
       const refreshed = await loadOwnedClipById(clip.id);
-      return ok(describe(refreshed ?? clip));
+      return respond(refreshed ?? clip, describe(refreshed ?? clip));
     }
-    return ok(describe(clip));
+    return respond(clip, describe(clip));
   }
 
   // Still with Fal.
@@ -173,9 +195,9 @@ export async function GET(
   if (!requestId) {
     if (ageMs > 2 * 60 * 1000) {
       await markClipFailed(clip.id, "The render was never submitted to Fal.");
-      return ok({ ...describe(clip), status: "FAILED", error: "The render was never submitted." });
+      return respond(clip, { ...describe(clip), status: "FAILED", error: "The render was never submitted." });
     }
-    return ok({ ...describe(clip), status: "IN_QUEUE" });
+    return respond(clip, { ...describe(clip), status: "IN_QUEUE" });
   }
 
   try {
@@ -187,9 +209,9 @@ export async function GET(
         await fal.queue.cancel(HUNYUAN_T2V_ENDPOINT, { requestId }).catch(() => undefined);
         const message = "Fal did not start the render within 15 minutes, so it was cancelled.";
         await markClipFailed(clip.id, message);
-        return ok({ ...describe(clip), status: "FAILED", error: message });
+        return respond(clip, { ...describe(clip), status: "FAILED", error: message });
       }
-      return ok({ ...describe(clip), status: "IN_QUEUE", queuePosition: status.queue_position });
+      return respond(clip, { ...describe(clip), status: "IN_QUEUE", queuePosition: status.queue_position });
     }
 
     if (status.status === "IN_PROGRESS") {
@@ -197,9 +219,9 @@ export async function GET(
         await fal.queue.cancel(HUNYUAN_T2V_ENDPOINT, { requestId }).catch(() => undefined);
         const message = "The render ran for over 30 minutes without finishing and was cancelled.";
         await markClipFailed(clip.id, message);
-        return ok({ ...describe(clip), status: "FAILED", error: message });
+        return respond(clip, { ...describe(clip), status: "FAILED", error: message });
       }
-      return ok({ ...describe(clip), status: "RENDERING" });
+      return respond(clip, { ...describe(clip), status: "RENDERING" });
     }
 
     // COMPLETED — fetch the output. A failed render surfaces here as an ApiError.
@@ -211,18 +233,18 @@ export async function GET(
         err instanceof ApiError ? `Fal reported the render failed (HTTP ${err.status}).` : "Fal reported the render failed.";
       console.error(`[clip-status] clip ${clip.id} result error:`, err instanceof ApiError ? err.body : err);
       await markClipFailed(clip.id, detail);
-      return ok({ ...describe(clip), status: "FAILED", error: detail });
+      return respond(clip, { ...describe(clip), status: "FAILED", error: detail });
     }
 
     if (!isHunyuanOutput(output)) {
       console.error(`[clip-status] clip ${clip.id} unexpected output:`, output);
       await markClipFailed(clip.id, "Fal finished but returned no video.");
-      return ok({ ...describe(clip), status: "FAILED", error: "The render returned no video." });
+      return respond(clip, { ...describe(clip), status: "FAILED", error: "The render returned no video." });
     }
 
     await finalizeRawVideo(clip.id, output);
     const refreshed = await loadOwnedClipById(clip.id);
-    return ok(describe(refreshed ?? clip));
+    return respond(refreshed ?? clip, describe(refreshed ?? clip));
   } catch (err) {
     if (err instanceof FalNotConfiguredError) {
       return errorResponse(500, "SERVER_MISCONFIGURED", "Video engine is not configured.");
@@ -231,7 +253,7 @@ export async function GET(
       console.error(`[clip-status] Fal status error ${err.status}:`, err.body);
       if (err.status === 404) {
         await markClipFailed(clip.id, "Fal no longer knows this render.");
-        return ok({ ...describe(clip), status: "FAILED", error: "The render was lost by Fal." });
+        return respond(clip, { ...describe(clip), status: "FAILED", error: "The render was lost by Fal." });
       }
       return errorResponse(502, "PROVIDER_ERROR", "Could not reach the video engine. Retrying…");
     }
@@ -262,7 +284,7 @@ export async function DELETE(
 
   // Only a render still with Fal can be cancelled.
   if (clip.status !== "PROCESSING" || clip.rawVideoUrl) {
-    return ok(describe(clip));
+    return respond(clip, describe(clip));
   }
 
   if (clip.providerRequestId) {
@@ -275,5 +297,5 @@ export async function DELETE(
   await markClipFailed(clip.id, "Cancelled by user.");
   console.info(`[clip-status] clip ${clip.id} cancelled by user`);
   const refreshed = await loadOwnedClipById(clip.id);
-  return ok(describe(refreshed ?? clip));
+  return respond(refreshed ?? clip, describe(refreshed ?? clip));
 }

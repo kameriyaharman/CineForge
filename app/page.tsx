@@ -31,6 +31,7 @@ import {
   Video,
   X,
 } from "lucide-react";
+import { AppHeader } from "@/components/app-header";
 import {
   ASPECT_RATIO_OPTIONS,
   DEFAULT_RENDER_SETTINGS,
@@ -715,27 +716,15 @@ export default function CineForgeStudioPage() {
         className="pointer-events-none absolute bottom-0 right-0 h-[420px] w-[620px] rounded-full bg-[radial-gradient(closest-side,rgba(139,92,246,0.10),transparent)]"
       />
 
-      {/* Header */}
-      <header className="relative z-10 border-b border-white/[0.06] bg-[#0B0F17]/70 backdrop-blur-xl">
-        <div className="mx-auto flex h-16 max-w-[1440px] items-center justify-between px-4 sm:px-8">
-          <div className="flex items-center gap-3">
-            <div className="flex size-9 items-center justify-center rounded-lg border border-indigo-400/40 bg-indigo-500/10 shadow-[0_0_20px_-4px_rgba(129,140,248,0.6)]">
-              <Aperture className="size-5 text-indigo-300" aria-hidden />
-            </div>
-            <span className="text-lg font-semibold tracking-tight">
-              Cine<span className="text-indigo-300">Forge</span>
-            </span>
-            <span className="ml-2 hidden rounded-full border border-violet-400/30 bg-violet-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.2em] text-violet-200 sm:inline">
-              Studio
-            </span>
-          </div>
-          <div className="hidden items-center gap-2 text-[11px] uppercase tracking-[0.22em] text-slate-500 md:flex">
+      <AppHeader
+        status={
+          <>
             <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
             Hunyuan Video · {renderSettings.aspectRatio} · {renderSettings.resolution} ·{" "}
             {durationLabel(renderSettings.numFrames)}
-          </div>
-        </div>
-      </header>
+          </>
+        }
+      />
 
       <main className="relative z-10 mx-auto grid max-w-[1440px] items-start gap-6 px-4 py-6 sm:px-8 sm:py-10 lg:grid-cols-[420px_minmax(0,1fr)] xl:grid-cols-[460px_minmax(0,1fr)]">
         {/* ============================ Production Panel ============================ */}

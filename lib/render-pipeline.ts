@@ -7,6 +7,7 @@ import {
   type MagnificResolution,
   type MagnificVideoUpscaleInput,
 } from "@/lib/magnific";
+import { archiveClipVideo } from "@/lib/assets";
 import { prisma } from "@/lib/prisma";
 
 /**
@@ -166,6 +167,9 @@ export async function finalizeRawVideo(
   });
   if (count === 0) return { claimed: false };
 
+  // Keep a permanent copy; Fal's link expires.
+  void archiveClipVideo(clipId, "RENDER", output.video.url);
+
   console.info(
     `[render] clip ${clipId} raw video ready`,
     JSON.stringify({ videoUrl: output.video.url, fileSize: output.video.file_size, seed }),
@@ -208,8 +212,8 @@ export async function completeWithoutUpscale(clipId: string, reason: string): Pr
  */
 async function runUpscaleSweep(clipId: string, rawVideoUrl: string): Promise<void> {
   let taskId: string;
+  const settings = getUpscaleSettings();
   try {
-    const settings = getUpscaleSettings();
     const task = await submitVideoUpscale({ video: rawVideoUrl, ...settings });
     taskId = task.taskId;
     console.info(
@@ -259,6 +263,7 @@ async function runUpscaleSweep(clipId: string, rawVideoUrl: string): Promise<voi
           where: { id: clipId },
           data: { status: "COMPLETED", upscaledVideoUrl: upscaledUrl, errorMessage: null },
         });
+        void archiveClipVideo(clipId, "UPSCALE", upscaledUrl, { resolution: settings.resolution });
         console.info(
           `[upscale] clip ${clipId} COMPLETED`,
           JSON.stringify({ taskId, upscaledVideoUrl: upscaledUrl }),
