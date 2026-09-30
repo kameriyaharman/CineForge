@@ -97,3 +97,44 @@ export async function assetUrl(storageKey: string, downloadName?: string): Promi
     return null;
   }
 }
+
+/**
+ * Copies finished clips from before the Asset Library existed (or whose copy
+ * failed) into the bucket. Idempotent; runs in the background on server start.
+ * Clips whose provider links have already expired are skipped with a log line.
+ */
+export async function backfillClipArchives(limit = 100): Promise<void> {
+  if (!isStorageConfigured()) return;
+  try {
+    const clips = await prisma.videoClip.findMany({
+      where: {
+        rawVideoUrl: { not: null },
+        status: { in: ["COMPLETED", "PROCESSING"] },
+        assets: { none: { role: "RENDER" } },
+      },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+      select: { id: true, rawVideoUrl: true, upscaledVideoUrl: true, assets: { select: { role: true } } },
+    });
+    const pendingUpscales = await prisma.videoClip.findMany({
+      where: { upscaledVideoUrl: { not: null }, assets: { none: { role: "UPSCALE" } } },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+      select: { id: true, upscaledVideoUrl: true },
+    });
+    if (clips.length === 0 && pendingUpscales.length === 0) return;
+
+    console.info(
+      `[assets] backfill: ${clips.length} render(s) and ${pendingUpscales.length} upscale(s) to copy into the library`,
+    );
+    for (const clip of clips) {
+      if (clip.rawVideoUrl) await archiveClipVideo(clip.id, "RENDER", clip.rawVideoUrl);
+    }
+    for (const clip of pendingUpscales) {
+      if (clip.upscaledVideoUrl) await archiveClipVideo(clip.id, "UPSCALE", clip.upscaledVideoUrl);
+    }
+    console.info("[assets] backfill finished");
+  } catch (err) {
+    console.error("[assets] backfill failed:", err);
+  }
+}
