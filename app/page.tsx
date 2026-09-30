@@ -590,7 +590,7 @@ export default function CineForgeStudioPage() {
           </div>
           <div className="hidden items-center gap-2 text-[11px] uppercase tracking-[0.22em] text-slate-500 md:flex">
             <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
-            Hunyuan Video · 16:9 · 580p
+            Hunyuan Video · 16:9 · 480p
           </div>
         </div>
       </header>
@@ -1604,7 +1604,7 @@ function RenderingPlaceholder({
         <div className="w-full max-w-md rounded-2xl border border-indigo-400/25 bg-[#0B0F17]/80 p-5 text-center shadow-[0_0_40px_-10px_rgba(129,140,248,0.5)] backdrop-blur-md sm:p-6">
           <Loader2 className="mx-auto mb-3 size-7 animate-spin text-indigo-300" aria-hidden />
           <p className="animate-pulse text-sm font-medium text-slate-100 sm:text-base">
-            🎬 CineForge AI Engine Rendering Clip (Approx 60s)...
+            🎬 CineForge AI Engine Rendering Clip (this can take a few minutes)…
           </p>
           <p className="mt-2 text-xs text-indigo-200/90">{caption}</p>
           <p className="mt-2 font-mono text-[11px] tracking-widest text-slate-500">

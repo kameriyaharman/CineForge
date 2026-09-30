@@ -387,12 +387,13 @@ export async function POST(
   }
 
   // Hunyuan on Fal takes aspect_ratio + resolution, not pixel dimensions.
-  // 16:9 at 580p is the closest supported preset to 1024x576.
+  // Speed-tuned: 480p and 85 frames (~3.5 s clip) render far faster than
+  // 580p/129 frames; the Magnific pass upscales delivery masters to 2K.
   const input: HunyuanVideoInput = {
     prompt: finalPrompt,
     aspect_ratio: "16:9",
-    resolution: "580p",
-    num_frames: 129,
+    resolution: "480p",
+    num_frames: 85,
     enable_safety_checker: true,
   };
 
