@@ -117,7 +117,10 @@ export async function archiveGenerationImages(generationId: string, images: Gene
         aspectRatio: true,
         quality: true,
         seed: true,
+        loraScale: true,
         createdAt: true,
+        characterId: true,
+        character: { select: { characterName: true } },
       },
     });
     if (!gen) return;
@@ -154,6 +157,9 @@ export async function archiveGenerationImages(generationId: string, images: Gene
                 height: image.height,
                 seed: gen.seed,
                 index: index + 1,
+                characterName: gen.character?.characterName ?? null,
+                characterId: gen.characterId,
+                likeness: gen.loraScale,
               } satisfies Prisma.InputJsonObject,
             },
           });

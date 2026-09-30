@@ -25,6 +25,7 @@ import {
   Wand2,
   X,
 } from "lucide-react";
+import Link from "next/link";
 import { AppHeader } from "@/components/app-header";
 import { SegmentedControl, type SegmentOption } from "@/components/segmented-control";
 import {
@@ -32,6 +33,7 @@ import {
   IMAGE_ASPECT_OPTIONS,
   IMAGE_COUNT_OPTIONS,
   IMAGE_MODELS,
+  modelsFor,
   IMAGE_PROMPT_MAX,
   IMAGE_PROMPT_MIN,
   STYLE_PRESETS,
@@ -42,6 +44,7 @@ import {
   type ImageModel,
   type ImageSettings,
 } from "@/lib/image-models";
+import { SOUL_LIKENESS_OPTIONS, type SoulHero } from "@/lib/soul-options";
 
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
@@ -187,12 +190,15 @@ export default function ImageStudioPage() {
   const [recentLoading, setRecentLoading] = useState(true);
   const [viewing, setViewing] = useState<Viewing | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [heroes, setHeroes] = useState<SoulHero[]>([]);
+  const [heroesLoaded, setHeroesLoaded] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const generationRef = useRef<string | null>(null);
   const hydrated = useRef(false);
 
   const model: ImageModel = getImageModel(settings.model) ?? IMAGE_MODELS[0];
+  const activeHero = heroes.find((h) => h.id === settings.characterId) ?? null;
   const trimmed = prompt.trim();
   const ready = trimmed.length >= IMAGE_PROMPT_MIN && trimmed.length <= IMAGE_PROMPT_MAX && !busy;
 
@@ -252,6 +258,38 @@ export default function ImageStudioPage() {
     void loadRecent();
   }, [loadRecent]);
 
+  /* ------------------------------ Soul ID heroes ------------------------------ */
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/soul-id", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = (await res.json()) as { heroes?: SoulHero[] };
+        if (cancelled || !Array.isArray(data.heroes)) return;
+        const ready = data.heroes.filter((h) => h.status === "READY");
+        setHeroes(ready);
+        // ?hero=<id> from the Soul ID page wins; otherwise keep the saved hero only if still ready.
+        const wanted = new URLSearchParams(window.location.search).get("hero");
+        setSettings((s) => {
+          if (wanted && ready.some((h) => h.id === wanted)) return normalizeImageSettings({ ...s, characterId: wanted });
+          if (s.characterId && !ready.some((h) => h.id === s.characterId)) {
+            return normalizeImageSettings({ ...s, characterId: null });
+          }
+          return s;
+        });
+      } catch {
+        // Soul ID is optional here
+      } finally {
+        if (!cancelled) setHeroesLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   /* ------------------------------ Settings UI ------------------------------ */
 
   const update = (patch: Partial<ImageSettings>) =>
@@ -306,6 +344,8 @@ export default function ImageStudioPage() {
           numImages: settings.numImages,
           style: settings.style,
           quality: settings.quality,
+          characterId: settings.characterId,
+          likeness: settings.characterId ? settings.likeness : undefined,
           seed,
         }),
         signal: controller.signal,
@@ -406,7 +446,10 @@ export default function ImageStudioPage() {
     if (img.prompt) setPrompt(img.prompt);
     const seed = metaNumber(img.meta, "seed");
     setSeedText(seed !== null ? String(seed) : "");
+    const heroId = metaString(img.meta, "characterId");
     update({
+      characterId: heroId && heroes.some((h) => h.id === heroId) ? heroId : null,
+      likeness: metaNumber(img.meta, "likeness") ?? settings.likeness,
       model: (metaString(img.meta, "model") ?? settings.model) as ImageSettings["model"],
       aspectRatio: (metaString(img.meta, "aspectRatio") ?? settings.aspectRatio) as ImageAspectRatio,
       quality: metaString(img.meta, "quality"),
@@ -435,6 +478,7 @@ export default function ImageStudioPage() {
         status={
           <>
             <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
+            {activeHero ? `${activeHero.name} · ` : ""}
             {model.label} · {settings.aspectRatio} · ×{settings.numImages}
             {settings.quality ? ` · ${settings.quality}` : ""}
           </>
@@ -486,11 +530,75 @@ export default function ImageStudioPage() {
               </p>
             </div>
 
+            {/* Soul ID */}
+            <fieldset className="space-y-2" disabled={busy}>
+              <legend className="mb-2 block text-[11px] font-medium uppercase tracking-[0.2em] text-slate-400">
+                Soul ID
+              </legend>
+              {heroesLoaded && heroes.length === 0 ? (
+                <p className="text-xs text-slate-500">
+                  No trained heroes yet.{" "}
+                  <Link href="/soul-id" className="text-indigo-300 hover:text-indigo-200">
+                    Train one in Soul ID →
+                  </Link>
+                </p>
+              ) : (
+                <div role="radiogroup" aria-label="Soul ID hero" className="flex flex-wrap gap-1.5">
+                  {[{ id: null as string | null, name: "No hero", coverUrl: null as string | null }, ...heroes].map((h) => {
+                    const selected = settings.characterId === h.id;
+                    return (
+                      <button
+                        key={h.id ?? "none"}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => update({ characterId: h.id })}
+                        className={cx(
+                          "flex h-9 items-center gap-2 rounded-full border pl-1 pr-3 text-xs transition-all disabled:opacity-60",
+                          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400",
+                          h.id === null && "pl-3",
+                          selected
+                            ? "border-indigo-400/60 bg-indigo-500/20 text-indigo-100"
+                            : "border-white/[0.08] text-slate-400 hover:border-white/20 hover:text-slate-200",
+                        )}
+                      >
+                        {h.id !== null &&
+                          (h.coverUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={h.coverUrl} alt="" className="size-7 rounded-full object-cover" />
+                          ) : (
+                            <span className="flex size-7 items-center justify-center rounded-full bg-indigo-500/20 text-[10px] font-semibold">
+                              {h.name.slice(0, 2).toUpperCase()}
+                            </span>
+                          ))}
+                        {h.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {activeHero && (
+                <>
+                  <p className="text-[11px] text-slate-500">
+                    {activeHero.name}&apos;s trained face is added to every image. Describe the scene, outfit and mood —
+                    no need to describe the face.
+                  </p>
+                  <SegmentedControl<number>
+                    label="Likeness"
+                    options={SOUL_LIKENESS_OPTIONS}
+                    value={settings.likeness}
+                    onChange={(likeness) => update({ likeness })}
+                    disabled={busy}
+                  />
+                </>
+              )}
+            </fieldset>
+
             {/* Model */}
             <fieldset className="space-y-2" disabled={busy}>
               <legend className="mb-2 block text-[11px] font-medium uppercase tracking-[0.2em] text-slate-400">Model</legend>
               <div role="radiogroup" aria-label="Model" className="grid gap-2 sm:grid-cols-2">
-                {IMAGE_MODELS.map((m) => {
+                {modelsFor(settings.characterId !== null).map((m) => {
                   const selected = m.id === settings.model;
                   return (
                     <button
@@ -498,7 +606,7 @@ export default function ImageStudioPage() {
                       type="button"
                       role="radio"
                       aria-checked={selected}
-                      onClick={() => update({ model: m.id })}
+                      onClick={() => update({ model: m.id as ImageSettings["model"] })}
                       className={cx(
                         "rounded-xl border p-3 text-left transition-all disabled:opacity-60",
                         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400",

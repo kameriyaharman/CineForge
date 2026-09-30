@@ -45,6 +45,8 @@ export interface ImageModel {
   readonly aspects: readonly ImageAspectRatio[];
   /** Output-size choices, when the model offers them. First is the default. */
   readonly qualities?: readonly ImageQualityOption[];
+  /** Uses a trained Soul ID face; only offered when a hero is selected. */
+  readonly soul?: boolean;
 }
 
 export const IMAGE_MODELS = [
@@ -88,6 +90,20 @@ export const IMAGE_MODELS = [
       { value: "2K", label: "2K", hint: "Sharper" },
       { value: "4K", label: "4K", hint: "Print / key art · highest price" },
     ],
+  },
+  {
+    id: "flux-lora-soul",
+    label: "FLUX Soul ID",
+    vendor: "Black Forest Labs + your hero",
+    tagline: "Your trained hero's face in any scene",
+    priceLabel: "≈ $0.035 / image (HD ≈ $0.07)",
+    speedLabel: "~10 s",
+    aspects: ["16:9", "21:9", "4:3", "1:1", "3:4", "9:16"],
+    qualities: [
+      { value: "standard", label: "Standard", hint: "About 1 megapixel · cheapest" },
+      { value: "hd", label: "HD", hint: "About 2 megapixels · double price" },
+    ],
+    soul: true,
   },
 ] as const satisfies readonly ImageModel[];
 
@@ -157,6 +173,10 @@ export interface ImageSettings {
   style: StylePresetId;
   /** Only for models with `qualities`. */
   quality: string | null;
+  /** Soul ID hero whose trained face to use; forces the Soul ID model. */
+  characterId: string | null;
+  /** LoRA strength for the Soul ID face. */
+  likeness: number;
 }
 
 export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
@@ -165,7 +185,16 @@ export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
   numImages: 2,
   style: "cinematic",
   quality: null,
+  characterId: null,
+  likeness: 1.0,
 };
+
+export const SOUL_IMAGE_MODEL_ID = "flux-lora-soul";
+
+/** Models offered in the picker: the Soul ID model with a hero, the others without. */
+export function modelsFor(hasHero: boolean): readonly ImageModel[] {
+  return IMAGE_MODELS.filter((m) => Boolean((m as ImageModel).soul) === hasHero);
+}
 
 export function getImageModel(id: unknown): ImageModel | undefined {
   return IMAGE_MODELS.find((m) => m.id === id);
@@ -192,7 +221,14 @@ export function buildImagePrompt(prompt: string, style: StylePreset | undefined)
 
 /** Keeps saved settings valid when the model list or a model's options change. */
 export function normalizeImageSettings(input: Partial<ImageSettings>): ImageSettings {
-  const model = getImageModel(input.model) ?? getImageModel(DEFAULT_IMAGE_SETTINGS.model)!;
+  const characterId = typeof input.characterId === "string" && input.characterId ? input.characterId : null;
+  const picked = getImageModel(input.model);
+  const model =
+    characterId !== null
+      ? getImageModel(SOUL_IMAGE_MODEL_ID)!
+      : picked && !picked.soul
+        ? picked
+        : getImageModel(DEFAULT_IMAGE_SETTINGS.model)!;
   const aspectRatio =
     isImageAspectRatio(input.aspectRatio) && model.aspects.includes(input.aspectRatio)
       ? input.aspectRatio
@@ -210,5 +246,10 @@ export function normalizeImageSettings(input: Partial<ImageSettings>): ImageSett
     numImages,
     style: style as StylePresetId,
     quality,
+    characterId,
+    likeness:
+      typeof input.likeness === "number" && [0.8, 1.0, 1.2].includes(input.likeness)
+        ? input.likeness
+        : DEFAULT_IMAGE_SETTINGS.likeness,
   };
 }

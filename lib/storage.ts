@@ -1,4 +1,4 @@
-import { Readable } from "node:stream";
+import { Readable, Transform, type TransformCallback } from "node:stream";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { DeleteObjectCommand, GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -120,8 +120,103 @@ export async function archiveFromUrl(
   return { key, contentType, byteSize: declaredSize ?? (uploaded || null) };
 }
 
+export class UploadTooLargeError extends Error {
+  constructor(limit: number) {
+    super(`File is larger than ${Math.round(limit / (1024 * 1024))} MB.`);
+    this.name = "UploadTooLargeError";
+  }
+}
+
+export class UploadTypeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UploadTypeError";
+  }
+}
+
+/** Counts bytes as they pass and stops the stream once `limit` is exceeded. */
+class ByteLimit extends Transform {
+  bytes = 0;
+  private checked = false;
+  constructor(
+    private readonly limit: number,
+    private readonly sniff?: (head: Buffer) => string | null,
+  ) {
+    super();
+  }
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback): void {
+    if (!this.checked && this.sniff) {
+      this.checked = true;
+      const problem = this.sniff(chunk);
+      if (problem) return cb(new UploadTypeError(problem));
+    }
+    this.bytes += chunk.length;
+    if (this.bytes > this.limit) return cb(new UploadTooLargeError(this.limit));
+    cb(null, chunk);
+  }
+}
+
+/**
+ * Streams an incoming upload (e.g. a request body) into the bucket without
+ * holding it in memory. `sniff` sees the first chunk and can reject the file.
+ */
+export async function uploadStream(
+  body: ReadableStream<Uint8Array>,
+  key: string,
+  contentType: string,
+  maxBytes: number,
+  sniff?: (head: Buffer) => string | null,
+): Promise<{ key: string; byteSize: number }> {
+  const { client, bucket } = getClient();
+  const limiter = new ByteLimit(maxBytes, sniff);
+  const source = Readable.fromWeb(body as unknown as WebReadableStream<Uint8Array>);
+  source.on("error", (err) => limiter.destroy(err));
+  source.pipe(limiter);
+  const upload = new Upload({
+    client,
+    params: { Bucket: bucket, Key: key, Body: limiter, ContentType: contentType },
+    queueSize: 2,
+    partSize: 8 * 1024 * 1024,
+  });
+  try {
+    await upload.done();
+  } catch (err) {
+    await upload.abort().catch(() => undefined);
+    throw err;
+  }
+  if (limiter.bytes === 0) {
+    await deleteObject(key).catch(() => undefined);
+    throw new UploadTypeError("The file is empty.");
+  }
+  return { key, byteSize: limiter.bytes };
+}
+
+/** Streams a stored object (for zipping etc.). */
+export async function getObjectStream(key: string): Promise<Readable> {
+  const { client, bucket } = getClient();
+  const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!res.Body) throw new Error(`Object ${key} has no body.`);
+  return res.Body as Readable;
+}
+
+/** Streams any readable (e.g. a zip being built) into the bucket. */
+export async function uploadReadable(body: Readable, key: string, contentType: string): Promise<void> {
+  const { client, bucket } = getClient();
+  const upload = new Upload({
+    client,
+    params: { Bucket: bucket, Key: key, Body: body, ContentType: contentType },
+    queueSize: 2,
+    partSize: 8 * 1024 * 1024,
+  });
+  await upload.done();
+}
+
 /** Short-lived link to a private object. `downloadName` forces a file download. */
-export async function presignGet(key: string, downloadName?: string): Promise<string> {
+export async function presignGet(
+  key: string,
+  downloadName?: string,
+  expiresIn: number = PRESIGN_TTL_SECONDS,
+): Promise<string> {
   const { client, bucket } = getClient();
   const command = new GetObjectCommand({
     Bucket: bucket,
@@ -130,7 +225,7 @@ export async function presignGet(key: string, downloadName?: string): Promise<st
       ? { ResponseContentDisposition: `attachment; filename="${downloadName.replace(/"/g, "")}"` }
       : {}),
   });
-  return getSignedUrl(client, command, { expiresIn: PRESIGN_TTL_SECONDS });
+  return getSignedUrl(client, command, { expiresIn });
 }
 
 export async function deleteObject(key: string): Promise<void> {

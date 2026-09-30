@@ -15,6 +15,8 @@ import { buildFalInput, falEndpointFor, markGenerationFailed } from "@/lib/image
 import { prisma } from "@/lib/prisma";
 import { FalNotConfiguredError, getFal, isFalConfigured } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
+import { loraLinkFor } from "@/lib/soul-id";
+import { isSoulLikeness } from "@/lib/soul-options";
 
 /**
  * POST /api/images — start an Image Studio generation.
@@ -44,7 +46,11 @@ interface ParsedBody {
   styleId: string;
   quality: string | null;
   seed: number | null;
+  characterId: string | null;
+  likeness: number;
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function parseBody(raw: unknown): { ok: true; body: ParsedBody } | { ok: false; message: string } {
   if (typeof raw !== "object" || raw === null) return { ok: false, message: "Body must be a JSON object." };
@@ -58,6 +64,22 @@ function parseBody(raw: unknown): { ok: true; body: ParsedBody } | { ok: false; 
 
   const model = getImageModel(b.model);
   if (!model) return { ok: false, message: "Unknown image model." };
+
+  let characterId: string | null = null;
+  if (b.characterId !== undefined && b.characterId !== null && b.characterId !== "") {
+    if (typeof b.characterId !== "string" || !UUID_RE.test(b.characterId)) {
+      return { ok: false, message: "Malformed Soul ID hero id." };
+    }
+    characterId = b.characterId.toLowerCase();
+  }
+  if (model.soul && !characterId) return { ok: false, message: "Pick a Soul ID hero for this model." };
+  if (!model.soul && characterId) return { ok: false, message: "Soul ID heroes work with the FLUX Soul ID model only." };
+
+  let likeness = 1.0;
+  if (b.likeness !== undefined && b.likeness !== null) {
+    if (!isSoulLikeness(b.likeness)) return { ok: false, message: "Likeness must be Loose, Balanced or Strong." };
+    likeness = b.likeness;
+  }
 
   if (!isImageAspectRatio(b.aspectRatio) || !model.aspects.includes(b.aspectRatio)) {
     return { ok: false, message: `${model.label} does not support that aspect ratio.` };
@@ -95,6 +117,8 @@ function parseBody(raw: unknown): { ok: true; body: ParsedBody } | { ok: false; 
       styleId: style.id,
       quality,
       seed,
+      characterId,
+      likeness,
     },
   };
 }
@@ -116,7 +140,27 @@ export async function POST(req: NextRequest) {
   const parsed = parseBody(raw);
   if (!parsed.ok) return errorResponse(400, "INVALID_BODY", parsed.message);
   const body = parsed.body;
-  const finalPrompt = buildImagePrompt(body.prompt, getStylePreset(body.styleId));
+  let finalPrompt = buildImagePrompt(body.prompt, getStylePreset(body.styleId));
+
+  // Soul ID: the hero must be trained, and the prompt carries its trigger word.
+  let lora: { url: string; scale: number } | undefined;
+  if (body.characterId) {
+    try {
+      const hero = await prisma.character.findFirst({
+        where: { id: body.characterId, userId: session.userId },
+        select: { characterName: true, soulStatus: true, triggerWord: true, loraKey: true },
+      });
+      if (!hero) return errorResponse(404, "HERO_NOT_FOUND", "Soul ID hero not found.");
+      if (hero.soulStatus !== "READY" || !hero.loraKey || !hero.triggerWord) {
+        return errorResponse(409, "HERO_NOT_READY", `${hero.characterName} hasn't finished training yet.`);
+      }
+      lora = { url: await loraLinkFor(hero.loraKey), scale: body.likeness };
+      finalPrompt = `photo of ${hero.triggerWord}, ${finalPrompt}`;
+    } catch (err) {
+      console.error("[images] hero lookup failed:", err);
+      return errorResponse(500, "DATABASE_ERROR", "Could not load the Soul ID hero.");
+    }
+  }
 
   let generationId: string;
   try {
@@ -135,6 +179,8 @@ export async function POST(req: NextRequest) {
         quality: body.quality,
         numImages: body.numImages,
         seed: body.seed,
+        characterId: body.characterId,
+        loraScale: body.characterId ? body.likeness : null,
         status: "PROCESSING",
       },
       select: { id: true },
@@ -153,13 +199,14 @@ export async function POST(req: NextRequest) {
     numImages: body.numImages,
     quality: body.quality,
     seed: body.seed,
+    lora,
   });
 
   try {
     const { request_id: requestId } = await getFal().queue.submit(endpoint, { input });
     await prisma.imageGeneration.update({ where: { id: generationId }, data: { providerRequestId: requestId } });
     console.info(
-      `[images] generation ${generationId} submitted as Fal ${requestId} · ${body.model} · ${body.aspectRatio} · x${body.numImages}${body.quality ? ` · ${body.quality}` : ""} · style=${body.styleId}`,
+      `[images] generation ${generationId} submitted as Fal ${requestId} · ${body.model} · ${body.aspectRatio} · x${body.numImages}${body.quality ? ` · ${body.quality}` : ""} · style=${body.styleId}${body.characterId ? ` · soul=${body.characterId} @${body.likeness}` : ""}`,
     );
     return NextResponse.json(
       { generationId, status: "IN_QUEUE", statusUrl: `/api/images/${generationId}`, finalPrompt },

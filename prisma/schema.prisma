@@ -40,6 +40,14 @@ enum FaceIdStatus {
   FAILED
 }
 
+/// Soul ID training lifecycle (LoRA trained on the hero's photos).
+enum SoulStatus {
+  NONE
+  TRAINING
+  READY
+  FAILED
+}
+
 // ---------------------------------- Models ----------------------------------
 
 model User {
@@ -72,11 +80,27 @@ model Character {
   /// Pinned Replicate model version used to produce faceIdVectors.
   faceIdModelVersion String?      @map("face_id_model_version") @db.VarChar(128)
   faceIdError        String?      @map("face_id_error") @db.Text
+
+  /// Soul ID: identity trained from uploaded photos.
+  soulStatus         SoulStatus   @default(NONE) @map("soul_status")
+  /// Training preset chosen by the user (see lib/soul-options.ts).
+  soulPreset         String?      @map("soul_preset") @db.VarChar(30)
+  /// Rare token the LoRA was trained on; put in prompts to call the face.
+  triggerWord        String?      @map("trigger_word") @db.VarChar(40)
+  /// Trained LoRA weights, copied into our bucket.
+  loraKey            String?      @map("lora_key") @db.Text
+  trainingRequestId  String?      @unique @map("training_request_id") @db.VarChar(128)
+  trainingError      String?      @map("training_error") @db.Text
+  trainingStartedAt  DateTime?    @map("training_started_at") @db.Timestamptz(3)
+  trainingFinishedAt DateTime?    @map("training_finished_at") @db.Timestamptz(3)
+
   createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  videoClips VideoClip[]
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  videoClips       VideoClip[]
+  photos           CharacterPhoto[]
+  imageGenerations ImageGeneration[]
 
   @@unique([userId, characterName])
   @@index([userId, createdAt(sort: Desc)])
@@ -176,15 +200,37 @@ model ImageGeneration {
   seed              Int?
   status            ClipStatus @default(PROCESSING)
   providerRequestId String?    @unique @map("provider_request_id") @db.VarChar(128)
+  /// Soul ID hero whose trained face was used, if any.
+  characterId       String?    @map("character_id") @db.Uuid
+  /// LoRA strength used with the Soul ID.
+  loraScale         Float?     @map("lora_scale")
   /// Provider output: [{ url, width, height, contentType }]
   outputs           Json?
   errorMessage      String?    @map("error_message") @db.Text
   createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  assets Asset[]
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  character Character? @relation(fields: [characterId], references: [id], onDelete: SetNull)
+  assets    Asset[]
 
   @@index([userId, createdAt(sort: Desc)])
+  @@index([characterId])
   @@map("image_generations")
+}
+
+/// A training photo of a Soul ID hero, stored privately in the bucket.
+model CharacterPhoto {
+  id          String   @id @default(uuid()) @db.Uuid
+  characterId String   @map("character_id") @db.Uuid
+  storageKey  String   @unique @map("storage_key") @db.Text
+  contentType String   @map("content_type") @db.VarChar(100)
+  byteSize    BigInt?  @map("byte_size")
+  fileName    String?  @map("file_name") @db.VarChar(200)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  character Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  @@index([characterId, createdAt])
+  @@map("character_photos")
 }

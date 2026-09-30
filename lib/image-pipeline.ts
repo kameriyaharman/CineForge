@@ -19,6 +19,8 @@ export interface ImageRequest {
   numImages: number;
   quality: string | null;
   seed: number | null;
+  /** Soul ID LoRA (required for the Soul ID model). */
+  lora?: { url: string; scale: number };
 }
 
 type Size = { width: number; height: number };
@@ -43,6 +45,26 @@ const SEEDREAM_SIZES: Record<ImageAspectRatio, Size> = {
   "9:16": { width: 1440, height: 2560 },
 };
 
+/** FLUX + LoRA is billed per megapixel, rounded up, so sizes stay just under 1 MP / 2 MP. */
+const SOUL_SIZES: Record<"standard" | "hd", Record<ImageAspectRatio, Size>> = {
+  standard: {
+    "16:9": { width: 1312, height: 736 },
+    "21:9": { width: 1504, height: 640 },
+    "4:3": { width: 1152, height: 864 },
+    "1:1": { width: 992, height: 992 },
+    "3:4": { width: 864, height: 1152 },
+    "9:16": { width: 736, height: 1312 },
+  },
+  hd: {
+    "16:9": { width: 1888, height: 1056 },
+    "21:9": { width: 2144, height: 912 },
+    "4:3": { width: 1632, height: 1216 },
+    "1:1": { width: 1408, height: 1408 },
+    "3:4": { width: 1216, height: 1632 },
+    "9:16": { width: 1056, height: 1888 },
+  },
+};
+
 export function falEndpointFor(model: ImageModelId): string {
   switch (model) {
     case "flux-2-flash":
@@ -53,6 +75,8 @@ export function falEndpointFor(model: ImageModelId): string {
       return "fal-ai/bytedance/seedream/v4.5/text-to-image";
     case "nano-banana-pro":
       return "fal-ai/nano-banana-pro";
+    case "flux-lora-soul":
+      return "fal-ai/flux-lora";
   }
 }
 
@@ -96,6 +120,21 @@ export function buildFalInput(req: ImageRequest): Record<string, unknown> {
         output_format: "png",
         seed,
       };
+    case "flux-lora-soul": {
+      if (!req.lora) throw new Error("Soul ID model needs a trained LoRA.");
+      const tier = req.quality === "hd" ? "hd" : "standard";
+      return {
+        prompt: req.prompt,
+        image_size: SOUL_SIZES[tier][req.aspectRatio],
+        loras: [{ path: req.lora.url, scale: req.lora.scale }],
+        num_images: req.numImages,
+        num_inference_steps: 28,
+        guidance_scale: 3.5,
+        output_format: "jpeg",
+        enable_safety_checker: true,
+        seed,
+      };
+    }
   }
 }
 
