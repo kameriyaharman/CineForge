@@ -112,6 +112,12 @@ function badgesFor(asset: LibraryAsset): string[] {
   if (res) badges.push(/k$/i.test(res) ? res.toUpperCase() : res);
   const dur = durationFromFrames(metaNumber(asset.meta, "numFrames"));
   if (dur) badges.push(dur);
+  const model = metaString(asset.meta, "modelLabel");
+  if (model) badges.push(model);
+  const quality = metaString(asset.meta, "quality");
+  if (quality) badges.push(quality);
+  const style = metaString(asset.meta, "style");
+  if (style) badges.push(style);
   const ar = metaString(asset.meta, "aspectRatio");
   if (ar) badges.push(ar);
   return badges;
@@ -303,11 +309,11 @@ export default function LibraryPage() {
               </p>
             </div>
             <Link
-              href="/"
+              href={filter === "IMAGE" ? "/images" : "/"}
               className="flex h-10 items-center gap-2 rounded-lg border border-indigo-400/50 bg-indigo-500/15 px-4 text-sm text-indigo-100 transition-all hover:bg-indigo-500/25"
             >
               <Sparkles className="size-4" aria-hidden />
-              Open Studio
+              {filter === "IMAGE" ? "Open Image Studio" : "Open Studio"}
             </Link>
           </div>
         ) : (

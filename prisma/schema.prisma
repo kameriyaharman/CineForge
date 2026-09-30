@@ -49,9 +49,10 @@ model User {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  characters Character[]
-  projects   Project[]
-  assets     Asset[]
+  characters       Character[]
+  projects         Project[]
+  assets           Asset[]
+  imageGenerations ImageGeneration[]
 
   @@map("users")
 }
@@ -134,6 +135,8 @@ model Asset {
   userId      String    @map("user_id") @db.Uuid
   /// The render this file belongs to, if any.
   clipId      String?   @map("clip_id") @db.Uuid
+  /// The Image Studio run this file came from, if any.
+  generationId String?  @map("generation_id") @db.Uuid
   kind        AssetKind
   role        AssetRole
   storageKey  String    @unique @map("storage_key") @db.Text
@@ -147,9 +150,41 @@ model Asset {
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
 
   user User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  clip VideoClip? @relation(fields: [clipId], references: [id], onDelete: SetNull)
+  clip       VideoClip?       @relation(fields: [clipId], references: [id], onDelete: SetNull)
+  generation ImageGeneration? @relation(fields: [generationId], references: [id], onDelete: SetNull)
 
   @@unique([clipId, role])
   @@index([userId, createdAt(sort: Desc)])
+  @@index([generationId])
   @@map("assets")
+}
+
+/// One Image Studio run: a prompt sent to a text-to-image model for 1–4 images.
+model ImageGeneration {
+  id                String     @id @default(uuid()) @db.Uuid
+  userId            String     @map("user_id") @db.Uuid
+  /// CineForge model id (see lib/image-models.ts), not the Fal endpoint.
+  model             String     @db.VarChar(60)
+  /// What the user typed.
+  prompt            String     @db.Text
+  /// What was sent to the model (prompt + style preset).
+  finalPrompt       String     @map("final_prompt") @db.Text
+  stylePreset       String?    @map("style_preset") @db.VarChar(40)
+  aspectRatio       String     @map("aspect_ratio") @db.VarChar(10)
+  quality           String?    @db.VarChar(10)
+  numImages         Int        @map("num_images")
+  seed              Int?
+  status            ClipStatus @default(PROCESSING)
+  providerRequestId String?    @unique @map("provider_request_id") @db.VarChar(128)
+  /// Provider output: [{ url, width, height, contentType }]
+  outputs           Json?
+  errorMessage      String?    @map("error_message") @db.Text
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assets Asset[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("image_generations")
 }

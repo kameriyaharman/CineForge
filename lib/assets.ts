@@ -1,5 +1,7 @@
 import { Prisma } from "@/lib/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
+import { getImageModel, getStylePreset } from "@/lib/image-models";
+import type { GeneratedImage } from "@/lib/image-pipeline";
 import { archiveFromUrl, isStorageConfigured, presignGet } from "@/lib/storage";
 
 /**
@@ -84,6 +86,86 @@ export async function archiveClipVideo(
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return; // raced; already archived
     console.error(`[assets] clip ${clipId} ${role} archive failed (provider link still works):`, err);
+  }
+}
+
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/webp": "webp",
+};
+
+/**
+ * Copies every image of an Image Studio generation into the bucket and records
+ * each as an IMAGE asset. Idempotent per image (the storage key is unique).
+ * Never throws — the page falls back to the provider links.
+ */
+export async function archiveGenerationImages(generationId: string, images: GeneratedImage[]): Promise<void> {
+  if (!isStorageConfigured()) {
+    console.warn("[assets] DEV NOTICE: S3_* storage variables not set — keeping provider links only.");
+    return;
+  }
+  try {
+    const gen = await prisma.imageGeneration.findUnique({
+      where: { id: generationId },
+      select: {
+        userId: true,
+        prompt: true,
+        model: true,
+        stylePreset: true,
+        aspectRatio: true,
+        quality: true,
+        seed: true,
+        createdAt: true,
+      },
+    });
+    if (!gen) return;
+    const stamp = gen.createdAt.toISOString().slice(0, 10);
+    const model = getImageModel(gen.model);
+    const style = getStylePreset(gen.stylePreset);
+
+    await Promise.all(
+      images.map(async (image, index) => {
+        const ext = IMAGE_EXTENSIONS[image.contentType.toLowerCase()] ?? "png";
+        const key = `users/${gen.userId}/images/${stamp}/${generationId}-${index + 1}.${ext}`;
+        try {
+          const existing = await prisma.asset.findUnique({ where: { storageKey: key }, select: { id: true } });
+          if (existing) return;
+          const stored = await archiveFromUrl(image.url, key, image.contentType);
+          await prisma.asset.create({
+            data: {
+              userId: gen.userId,
+              generationId,
+              kind: "IMAGE",
+              role: "IMAGE",
+              storageKey: key,
+              contentType: stored.contentType,
+              byteSize: stored.byteSize !== null ? BigInt(stored.byteSize) : null,
+              sourceUrl: image.url,
+              prompt: gen.prompt,
+              meta: {
+                model: gen.model,
+                modelLabel: model?.label ?? gen.model,
+                style: style && style.id !== "none" ? style.label : null,
+                aspectRatio: gen.aspectRatio,
+                quality: gen.quality,
+                width: image.width,
+                height: image.height,
+                seed: gen.seed,
+                index: index + 1,
+              } satisfies Prisma.InputJsonObject,
+            },
+          });
+        } catch (err) {
+          if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return;
+          console.error(`[assets] image ${index + 1} of generation ${generationId} archive failed:`, err);
+        }
+      }),
+    );
+    console.info(`[assets] generation ${generationId}: ${images.length} image(s) archived`);
+  } catch (err) {
+    console.error(`[assets] generation ${generationId} archive failed:`, err);
   }
 }
 

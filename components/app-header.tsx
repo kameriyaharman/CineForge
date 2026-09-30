@@ -3,10 +3,11 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { Aperture, Clapperboard, FolderOpen } from "lucide-react";
+import { Aperture, Clapperboard, FolderOpen, ImageIcon } from "lucide-react";
 
 const NAV = [
-  { href: "/", label: "Studio", icon: Clapperboard },
+  { href: "/images", label: "Images", icon: ImageIcon },
+  { href: "/", label: "Video", icon: Clapperboard },
   { href: "/library", label: "Library", icon: FolderOpen },
 ] as const;
 
