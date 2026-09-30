@@ -97,11 +97,21 @@ interface ClipStatusResponse {
   status: ClipPhase;
   queuePosition?: number;
   videoUrl?: string;
+  rawVideoUrl?: string;
+  upscaledVideoUrl?: string;
   seed?: number;
   finalPrompt: string;
   error?: string;
   note?: string;
+  upscale?: { enabled: boolean; resolution: string };
 }
+
+/** State of the delivery master after the raw render is on screen. */
+type MasterState =
+  | { kind: "none" }
+  | { kind: "upscaling"; resolution: string }
+  | { kind: "ready"; resolution: string }
+  | { kind: "raw"; reason: string };
 
 interface ApiErrorResponse {
   error: string;
@@ -208,6 +218,9 @@ function isClipStatus(value: unknown): value is ClipStatusResponse {
 }
 
 const STATUS_POLL_MS = 4000;
+/** Magnific runs after the raw render; check less often, and give up after 35 min. */
+const UPSCALE_POLL_MS = 10_000;
+const UPSCALE_MAX_WAIT_MS = 35 * 60 * 1000;
 const MAX_POLL_FAILURES = 6;
 
 const sleep = (ms: number, signal: AbortSignal) =>
@@ -275,6 +288,7 @@ export default function CineForgeStudioPage() {
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState<number>(() => Date.now());
   const [phase, setPhase] = useState<ClipPhase | null>(null);
+  const [master, setMaster] = useState<MasterState>({ kind: "none" });
   const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const renderAbortRef = useRef<AbortController | null>(null);
   const activeClipIdRef = useRef<string | null>(null);
@@ -373,6 +387,43 @@ export default function CineForgeStudioPage() {
     setActiveCharacterId((current) => (current === id ? null : id));
   }, []);
 
+  /** Polls a clip whose raw video is on screen until the upscaled master lands. */
+  const followUpscale = useCallback(
+    async (statusUrl: string, signal: AbortSignal, resolution: string) => {
+      const deadline = Date.now() + UPSCALE_MAX_WAIT_MS;
+      let failures = 0;
+      while (Date.now() < deadline) {
+        await sleep(UPSCALE_POLL_MS, signal);
+        let status: unknown = null;
+        try {
+          const res = await fetch(statusUrl, { cache: "no-store", signal });
+          status = res.ok ? await readJson(res) : null;
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") throw err;
+        }
+        if (!isClipStatus(status)) {
+          failures += 1;
+          if (failures >= MAX_POLL_FAILURES) break;
+          continue;
+        }
+        failures = 0;
+        if (status.status === "COMPLETED") {
+          if (status.upscaledVideoUrl) {
+            setVideoUrl(status.upscaledVideoUrl);
+            setMaster({ kind: "ready", resolution });
+            notify("success", `${resolution.toUpperCase()} master ready`, "The player now shows the upscaled file.");
+          } else {
+            setMaster({ kind: "raw", reason: status.note ?? "The upscale was skipped." });
+          }
+          return;
+        }
+        if (status.status === "FAILED") break;
+      }
+      setMaster({ kind: "raw", reason: "The upscale did not finish; the raw render is available." });
+    },
+    [notify],
+  );
+
   const generateVideo = useCallback(
     async (event?: FormEvent<HTMLFormElement>) => {
       event?.preventDefault();
@@ -412,6 +463,7 @@ export default function CineForgeStudioPage() {
       setError(null);
       setVideoUrl(null);
       setMeta(null);
+      setMaster({ kind: "none" });
 
       const payload: GenerateVideoRequest = {
         prompt: prompt.trim(),
@@ -422,6 +474,7 @@ export default function CineForgeStudioPage() {
       setPhase(null);
       setQueuePosition(null);
       activeClipIdRef.current = null;
+      let videoShown = false;
 
       try {
         // 1. Submit — returns in about a second with a clip id.
@@ -480,6 +533,7 @@ export default function CineForgeStudioPage() {
           }
 
           if ((status.status === "COMPLETED" || status.status === "UPSCALING") && status.videoUrl) {
+            videoShown = true;
             setVideoUrl(status.videoUrl);
             setMeta({
               seed: status.seed,
@@ -488,19 +542,40 @@ export default function CineForgeStudioPage() {
               characterName: lockedCharacter.characterName,
               cameraMovement: lockedCamera,
             });
+
+            if (status.status === "COMPLETED") {
+              setMaster(
+                status.upscaledVideoUrl
+                  ? { kind: "ready", resolution: status.upscale?.resolution ?? "4k" }
+                  : {
+                      kind: "raw",
+                      reason: status.upscale?.enabled
+                        ? (status.note ?? "The upscale was skipped.")
+                        : "Upscaler not configured.",
+                    },
+              );
+              notify("success", "Sequence rendered", `${lockedCharacter.characterName} · ${lockedCamera}`);
+              break;
+            }
+
+            // Raw render is ready; the master is upscaling. Show the raw clip now
+            // and keep checking until the upscaled file replaces it.
+            const resolution = status.upscale?.resolution ?? "4k";
+            setMaster({ kind: "upscaling", resolution });
+            setLoading(false);
             notify(
               "success",
               "Sequence rendered",
-              status.status === "UPSCALING"
-                ? "Showing the raw render; the 2K master is upscaling in the background."
-                : `${lockedCharacter.characterName} · ${lockedCamera}`,
+              `Showing the raw render; the ${resolution.toUpperCase()} master is upscaling.`,
             );
+            await followUpscale(accepted.statusUrl, controller.signal, resolution);
             break;
           }
         }
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") {
-          setError("Render cancelled.");
+          // Aborting while only the upscale is pending keeps the raw video on screen.
+          if (!videoShown) setError("Render cancelled.");
         } else if (err instanceof TypeError) {
           setError("Network error. Check your connection and try again.");
         } else {
@@ -514,7 +589,7 @@ export default function CineForgeStudioPage() {
         setLoading(false);
       }
     },
-    [activeCharacter, cameraMovement, characters.length, loading, notify, prompt, promptValid],
+    [activeCharacter, cameraMovement, characters.length, followUpscale, loading, notify, prompt, promptValid],
   );
 
   const handleCancel = useCallback(() => {
@@ -527,9 +602,11 @@ export default function CineForgeStudioPage() {
   }, []);
 
   const handleReset = useCallback(() => {
+    renderAbortRef.current?.abort();
     setError(null);
     setVideoUrl(null);
     setMeta(null);
+    setMaster({ kind: "none" });
   }, []);
 
   const handlePromptKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -839,6 +916,29 @@ export default function CineForgeStudioPage() {
                   <dt className="text-slate-500">Seed</dt>
                   <dd className="font-mono tabular-nums text-slate-200">{meta.seed ?? "—"}</dd>
                 </div>
+                {master.kind !== "none" && (
+                  <div className="flex items-center gap-1.5">
+                    <dt className="text-slate-500">Master</dt>
+                    <dd
+                      className={cx(
+                        "flex items-center gap-1.5 font-mono",
+                        master.kind === "ready" && "text-emerald-300",
+                        master.kind === "upscaling" && "text-violet-300",
+                        master.kind === "raw" && "text-slate-400",
+                      )}
+                      title={master.kind === "raw" ? master.reason : undefined}
+                    >
+                      {master.kind === "upscaling" && (
+                        <>
+                          <Loader2 className="size-3 animate-spin" aria-hidden />
+                          Upscaling to {master.resolution.toUpperCase()}…
+                        </>
+                      )}
+                      {master.kind === "ready" && `${master.resolution.toUpperCase()} upscaled`}
+                      {master.kind === "raw" && "Raw render"}
+                    </dd>
+                  </div>
+                )}
               </dl>
               <div className="flex gap-2">
                 <button
@@ -857,7 +957,7 @@ export default function CineForgeStudioPage() {
                   className="flex h-9 items-center gap-2 rounded-lg border border-indigo-400/50 bg-indigo-500/15 px-3 text-xs font-medium text-indigo-100 transition-all hover:bg-indigo-500/25 hover:shadow-[0_0_20px_-4px_rgba(129,140,248,0.7)]"
                 >
                   <Download className="size-3.5" aria-hidden />
-                  Download MP4
+                  {master.kind === "ready" ? `Download ${master.resolution.toUpperCase()}` : "Download MP4"}
                 </a>
               </div>
             </div>

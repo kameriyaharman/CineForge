@@ -1,5 +1,6 @@
 import { ApiError } from "@fal-ai/client";
 import { NextResponse, type NextRequest } from "next/server";
+import { isMagnificConfigured } from "@/lib/magnific";
 import { prisma } from "@/lib/prisma";
 import {
   FalNotConfiguredError,
@@ -10,6 +11,7 @@ import {
   completeWithoutUpscale,
   finalizeRawVideo,
   getFal,
+  getUpscaleSettings,
   isHunyuanOutput,
   markClipFailed,
 } from "@/lib/render-pipeline";
@@ -46,6 +48,8 @@ interface ClipStatusResponse {
   error?: string;
   /** Non-fatal note, e.g. why the upscale was skipped. */
   note?: string;
+  /** Whether a Magnific upscale runs after the render, and its target. */
+  upscale: { enabled: boolean; resolution: string };
 }
 
 interface ApiErrorBody {
@@ -95,6 +99,7 @@ function describe(clip: OwnedClip): ClipStatusResponse {
     seed: clip.seed ?? undefined,
     rawVideoUrl: clip.rawVideoUrl ?? undefined,
     upscaledVideoUrl: clip.upscaledVideoUrl ?? undefined,
+    upscale: { enabled: isMagnificConfigured(), resolution: getUpscaleSettings().resolution },
   };
 
   if (clip.status === "FAILED") {

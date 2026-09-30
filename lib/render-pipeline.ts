@@ -4,6 +4,7 @@ import {
   getVideoUpscaleTask,
   isMagnificConfigured,
   submitVideoUpscale,
+  type MagnificResolution,
   type MagnificVideoUpscaleInput,
 } from "@/lib/magnific";
 import { prisma } from "@/lib/prisma";
@@ -25,19 +26,36 @@ export const UPSCALE_STALE_MS = 40 * 60 * 1000;
 
 /**
  * Magnific upscale settings for delivery masters.
- *  - resolution "2k": Magnific takes a target resolution, not a multiplier.
- *    Hunyuan outputs ~1024x576, so 2x lands at ~2K. Use "4k" for true 4K
- *    (Magnific bills per frame, and 4K costs more per frame).
+ *  - resolution: Magnific's video upscaler takes a target resolution
+ *    ("720p" | "1k" | "2k" | "4k"), not a multiplier. Default "4k"; override
+ *    with MAGNIFIC_RESOLUTION on Railway to cut cost (billed per frame, and
+ *    4K costs the most per frame).
  *  - creativity 3 (of 0–100): very low, so faces are not re-invented.
- *  - The video upscaler has no HDR control; `flavor: "vivid"` is the closest
- *    contrast/colour option and is also the API default.
+ *  - The video API has no HDR or resolution-factor parameter (those exist only
+ *    on Magnific's image upscaler); `flavor: "vivid"` is the closest
+ *    contrast/colour control and is the API default.
  */
-export const UPSCALE_SETTINGS = {
-  resolution: "2k",
-  creativity: 3,
-  flavor: "vivid",
-  output_format: "h264",
-} as const satisfies Omit<MagnificVideoUpscaleInput, "video">;
+const MAGNIFIC_RESOLUTIONS = ["720p", "1k", "2k", "4k"] as const;
+
+function resolveUpscaleResolution(): MagnificResolution {
+  const raw = process.env.MAGNIFIC_RESOLUTION?.trim().toLowerCase();
+  if (!raw) return "4k";
+  if ((MAGNIFIC_RESOLUTIONS as readonly string[]).includes(raw)) return raw as MagnificResolution;
+  console.warn(`[upscale] MAGNIFIC_RESOLUTION="${raw}" is not one of ${MAGNIFIC_RESOLUTIONS.join(", ")}; using 4k.`);
+  return "4k";
+}
+
+export function getUpscaleSettings(): Omit<MagnificVideoUpscaleInput, "video"> & {
+  resolution: MagnificResolution;
+} {
+  return {
+    resolution: resolveUpscaleResolution(),
+    creativity: 3,
+    flavor: "vivid",
+    output_format: "h264",
+  };
+}
+
 const UPSCALE_POLL_INTERVAL_MS = 10_000;
 const UPSCALE_MAX_WAIT_MS = 30 * 60 * 1000;
 const UPSCALE_MAX_POLL_FAILURES = 6;
@@ -158,7 +176,9 @@ export async function finalizeRawVideo(
       console.error(`[upscale] clip ${clipId} sweep crashed:`, err),
     );
   } else {
-    console.warn("[render] MAGNIFIC_API_KEY not set — skipping upscale.");
+    console.warn(
+      "[render] DEV NOTICE: MAGNIFIC_API_KEY is not set — skipping the upscale and delivering the raw video.",
+    );
   }
   return { claimed: true, upscaleQueued: upscaleEnabled };
 }
@@ -189,10 +209,11 @@ export async function completeWithoutUpscale(clipId: string, reason: string): Pr
 async function runUpscaleSweep(clipId: string, rawVideoUrl: string): Promise<void> {
   let taskId: string;
   try {
-    const task = await submitVideoUpscale({ video: rawVideoUrl, ...UPSCALE_SETTINGS });
+    const settings = getUpscaleSettings();
+    const task = await submitVideoUpscale({ video: rawVideoUrl, ...settings });
     taskId = task.taskId;
     console.info(
-      `[upscale] clip ${clipId} → Magnific task ${taskId} (${UPSCALE_SETTINGS.resolution}, creativity ${UPSCALE_SETTINGS.creativity})`,
+      `[upscale] clip ${clipId} → Magnific task ${taskId} (${settings.resolution}, creativity ${settings.creativity})`,
     );
   } catch (err) {
     const detail =
