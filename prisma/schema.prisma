@@ -90,6 +90,10 @@ model VideoClip {
   characterId       String?    @map("character_id") @db.Uuid
   prompt            String     @db.Text
   cameraMovement    String?    @map("camera_movement") @db.VarChar(40)
+  /// Render settings chosen on the dashboard.
+  resolution        String?    @db.VarChar(10)
+  numFrames         Int?       @map("num_frames")
+  aspectRatio       String?    @map("aspect_ratio") @db.VarChar(10)
   rawVideoUrl       String?    @map("raw_video_url") @db.Text
   upscaledVideoUrl  String?    @map("upscaled_video_url") @db.Text
   status            ClipStatus @default(PENDING)

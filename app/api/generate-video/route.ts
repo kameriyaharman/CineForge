@@ -3,6 +3,16 @@ import { NextResponse, type NextRequest } from "next/server";
 import { Prisma } from "@/lib/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import {
+  ASPECT_RATIO_OPTIONS,
+  DEFAULT_RENDER_SETTINGS,
+  DURATION_OPTIONS,
+  RESOLUTION_OPTIONS,
+  isAspectRatio,
+  isNumFrames,
+  isVideoResolution,
+  type RenderSettings,
+} from "@/lib/render-options";
+import {
   FalNotConfiguredError,
   HUNYUAN_T2V_ENDPOINT,
   getFal,
@@ -50,6 +60,7 @@ interface GenerateVideoBody {
   cameraMovement: CameraMovement | null;
   activeCharacterId: string | null;
   projectId: string | null;
+  settings: RenderSettings;
 }
 
 /** The character data this route needs from the database. */
@@ -73,6 +84,7 @@ interface IdentityPlan {
 
 interface GenerateVideoAccepted {
   clipId: string;
+  settings: RenderSettings;
   projectId: string;
   requestId: string;
   status: "IN_QUEUE";
@@ -179,6 +191,35 @@ function parseBody(body: unknown): ParseResult {
     project = projectId.toLowerCase();
   }
 
+  // Render settings chosen on the dashboard. Omitted → defaults (older clients).
+  const numFrames = isBlank(raw.numFrames) ? DEFAULT_RENDER_SETTINGS.numFrames : Number(raw.numFrames);
+  if (!isNumFrames(numFrames)) {
+    return {
+      ok: false,
+      code: "INVALID_DURATION",
+      message: "`numFrames` is not a supported duration.",
+      details: { allowed: DURATION_OPTIONS.map((o) => o.value) },
+    };
+  }
+  const resolution = isBlank(raw.resolution) ? DEFAULT_RENDER_SETTINGS.resolution : raw.resolution;
+  if (!isVideoResolution(resolution)) {
+    return {
+      ok: false,
+      code: "INVALID_RESOLUTION",
+      message: "`resolution` is not supported.",
+      details: { allowed: RESOLUTION_OPTIONS.map((o) => o.value) },
+    };
+  }
+  const aspectRatio = isBlank(raw.aspectRatio) ? DEFAULT_RENDER_SETTINGS.aspectRatio : raw.aspectRatio;
+  if (!isAspectRatio(aspectRatio)) {
+    return {
+      ok: false,
+      code: "INVALID_ASPECT_RATIO",
+      message: "`aspectRatio` is not supported.",
+      details: { allowed: ASPECT_RATIO_OPTIONS.map((o) => o.value) },
+    };
+  }
+
   return {
     ok: true,
     data: {
@@ -186,6 +227,7 @@ function parseBody(body: unknown): ParseResult {
       cameraMovement: movement,
       activeCharacterId,
       projectId: project,
+      settings: { numFrames, resolution, aspectRatio },
     },
   };
 }
@@ -330,7 +372,7 @@ export async function POST(
   if (!parsed.ok) {
     return errorResponse(400, parsed.code, parsed.message, parsed.details);
   }
-  const { prompt, cameraMovement, activeCharacterId } = parsed.data;
+  const { prompt, cameraMovement, activeCharacterId, settings } = parsed.data;
 
   // 3. Character + project lookups (scoped to this user) and clip creation.
   let character: CharacterReference | null = null;
@@ -369,6 +411,9 @@ export async function POST(
         characterId: character?.id ?? null,
         prompt: finalPrompt,
         cameraMovement,
+        resolution: settings.resolution,
+        numFrames: settings.numFrames,
+        aspectRatio: settings.aspectRatio,
         status: "PROCESSING",
       },
       select: { id: true },
@@ -386,14 +431,13 @@ export async function POST(
     return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");
   }
 
-  // Hunyuan on Fal takes aspect_ratio + resolution, not pixel dimensions.
-  // Speed-tuned: 480p and 85 frames (~3.5 s clip) render far faster than
-  // 580p/129 frames; the Magnific pass upscales delivery masters to 2K.
+  // Settings come from the dashboard (validated above). Fal bills Hunyuan per
+  // video, so these change render time, not price.
   const input: HunyuanVideoInput = {
     prompt: finalPrompt,
-    aspect_ratio: "16:9",
-    resolution: "480p",
-    num_frames: 85,
+    aspect_ratio: settings.aspectRatio,
+    resolution: settings.resolution,
+    num_frames: settings.numFrames,
     enable_safety_checker: true,
   };
 
@@ -407,12 +451,13 @@ export async function POST(
     });
 
     console.info(
-      `[generate-video] clip ${clipId} submitted as Fal ${requestId} · character=${character?.characterName ?? "none"} · identity=${identity.mode}`,
+      `[generate-video] clip ${clipId} submitted as Fal ${requestId} · ${settings.resolution} · ${settings.numFrames} frames · ${settings.aspectRatio} · character=${character?.characterName ?? "none"} · identity=${identity.mode}`,
     );
 
     return NextResponse.json(
       {
         clipId,
+        settings,
         projectId,
         requestId,
         status: "IN_QUEUE",

@@ -31,6 +31,17 @@ import {
   Video,
   X,
 } from "lucide-react";
+import {
+  ASPECT_RATIO_OPTIONS,
+  DEFAULT_RENDER_SETTINGS,
+  DURATION_OPTIONS,
+  RESOLUTION_OPTIONS,
+  durationLabel,
+  isAspectRatio,
+  isNumFrames,
+  isVideoResolution,
+  type RenderSettings,
+} from "@/lib/render-options";
 
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
@@ -78,6 +89,27 @@ interface GenerateVideoRequest {
   prompt: string;
   cameraMovement: CameraMovement;
   characterId: string;
+  numFrames: RenderSettings["numFrames"];
+  resolution: RenderSettings["resolution"];
+  aspectRatio: RenderSettings["aspectRatio"];
+}
+
+const SETTINGS_STORAGE_KEY = "cineforge.renderSettings";
+
+/** Last-used settings for this browser; falls back to defaults if missing or invalid. */
+function loadSavedSettings(): RenderSettings {
+  try {
+    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return DEFAULT_RENDER_SETTINGS;
+    const saved = JSON.parse(raw) as Partial<RenderSettings>;
+    return {
+      numFrames: isNumFrames(saved.numFrames) ? saved.numFrames : DEFAULT_RENDER_SETTINGS.numFrames,
+      resolution: isVideoResolution(saved.resolution) ? saved.resolution : DEFAULT_RENDER_SETTINGS.resolution,
+      aspectRatio: isAspectRatio(saved.aspectRatio) ? saved.aspectRatio : DEFAULT_RENDER_SETTINGS.aspectRatio,
+    };
+  } catch {
+    return DEFAULT_RENDER_SETTINGS;
+  }
 }
 
 /** 202 from POST /api/generate-video — the render is queued at Fal. */
@@ -125,6 +157,7 @@ interface RenderMeta {
   elapsedMs: number;
   characterName: string;
   cameraMovement: CameraMovement;
+  settings: RenderSettings;
 }
 
 type ToastTone = "info" | "success" | "error";
@@ -281,6 +314,22 @@ export default function CineForgeStudioPage() {
   /* ---------------------------- Generation state --------------------------- */
   const [prompt, setPrompt] = useState<string>("");
   const [cameraMovement, setCameraMovement] = useState<CameraMovement>("STATIC");
+  const [renderSettings, setRenderSettings] = useState<RenderSettings>(DEFAULT_RENDER_SETTINGS);
+  const settingsLoadedRef = useRef<boolean>(false);
+
+  // Restore the last-used settings once, then remember every change.
+  useEffect(() => {
+    if (!settingsLoadedRef.current) {
+      settingsLoadedRef.current = true;
+      setRenderSettings(loadSavedSettings());
+      return;
+    }
+    try {
+      window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(renderSettings));
+    } catch {
+      // Storage unavailable (private mode); settings still apply for this visit.
+    }
+  }, [renderSettings]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -465,10 +514,14 @@ export default function CineForgeStudioPage() {
       setMeta(null);
       setMaster({ kind: "none" });
 
+      const lockedSettings = renderSettings;
       const payload: GenerateVideoRequest = {
         prompt: prompt.trim(),
         cameraMovement: lockedCamera,
         characterId: lockedCharacter.id,
+        numFrames: lockedSettings.numFrames,
+        resolution: lockedSettings.resolution,
+        aspectRatio: lockedSettings.aspectRatio,
       };
 
       setPhase(null);
@@ -541,6 +594,7 @@ export default function CineForgeStudioPage() {
               elapsedMs: Date.now() - began,
               characterName: lockedCharacter.characterName,
               cameraMovement: lockedCamera,
+              settings: lockedSettings,
             });
 
             if (status.status === "COMPLETED") {
@@ -589,7 +643,17 @@ export default function CineForgeStudioPage() {
         setLoading(false);
       }
     },
-    [activeCharacter, cameraMovement, characters.length, followUpscale, loading, notify, prompt, promptValid],
+    [
+      activeCharacter,
+      cameraMovement,
+      characters.length,
+      followUpscale,
+      loading,
+      notify,
+      prompt,
+      promptValid,
+      renderSettings,
+    ],
   );
 
   const handleCancel = useCallback(() => {
@@ -667,7 +731,8 @@ export default function CineForgeStudioPage() {
           </div>
           <div className="hidden items-center gap-2 text-[11px] uppercase tracking-[0.22em] text-slate-500 md:flex">
             <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
-            Hunyuan Video · 16:9 · 480p
+            Hunyuan Video · {renderSettings.aspectRatio} · {renderSettings.resolution} ·{" "}
+            {durationLabel(renderSettings.numFrames)}
           </div>
         </div>
       </header>
@@ -752,6 +817,37 @@ export default function CineForgeStudioPage() {
                   onChange={setCameraMovement}
                   disabled={loading}
                 />
+              </div>
+
+              {/* Render settings */}
+              <div className="space-y-3">
+                <span className="block text-[11px] font-medium uppercase tracking-[0.2em] text-slate-400">
+                  Render Settings
+                </span>
+                <SegmentedControl
+                  label="Duration"
+                  options={DURATION_OPTIONS}
+                  value={renderSettings.numFrames}
+                  onChange={(numFrames) => setRenderSettings((s) => ({ ...s, numFrames }))}
+                  disabled={loading}
+                />
+                <SegmentedControl
+                  label="Resolution"
+                  options={RESOLUTION_OPTIONS}
+                  value={renderSettings.resolution}
+                  onChange={(resolution) => setRenderSettings((s) => ({ ...s, resolution }))}
+                  disabled={loading}
+                />
+                <SegmentedControl
+                  label="Format"
+                  options={ASPECT_RATIO_OPTIONS}
+                  value={renderSettings.aspectRatio}
+                  onChange={(aspectRatio) => setRenderSettings((s) => ({ ...s, aspectRatio }))}
+                  disabled={loading}
+                />
+                <p className="text-[11px] leading-relaxed text-slate-500">
+                  Fal charges the same per video. Longer and sharper clips take longer to render.
+                </p>
               </div>
 
               {/* Locked identity summary */}
@@ -910,6 +1006,13 @@ export default function CineForgeStudioPage() {
                   <dt className="text-slate-500">Render</dt>
                   <dd className="font-mono tabular-nums text-slate-200">
                     {formatElapsed(meta.elapsedMs)}
+                  </dd>
+                </div>
+                <div className="flex gap-1.5">
+                  <dt className="text-slate-500">Output</dt>
+                  <dd className="font-mono text-slate-200">
+                    {meta.settings.resolution} · {durationLabel(meta.settings.numFrames)} ·{" "}
+                    {meta.settings.aspectRatio}
                   </dd>
                 </div>
                 <div className="flex gap-1.5">
@@ -1414,6 +1517,71 @@ function CharacterForm({
         )}
       </button>
     </form>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             Segmented Control                              */
+/* -------------------------------------------------------------------------- */
+
+interface SegmentOption<T extends string | number> {
+  readonly value: T;
+  readonly label: string;
+  readonly hint: string;
+}
+
+function SegmentedControl<T extends string | number>({
+  label,
+  options,
+  value,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  options: readonly SegmentOption<T>[];
+  value: T;
+  onChange: (value: T) => void;
+  disabled?: boolean;
+}) {
+  const active = options.find((o) => o.value === value);
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-20 shrink-0 text-xs text-slate-400">{label}</span>
+      <div className="min-w-0 flex-1">
+        <div
+          role="radiogroup"
+          aria-label={label}
+          className="grid gap-1 rounded-lg border border-white/[0.08] bg-[#0B0F17] p-1"
+          style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}
+        >
+          {options.map((option) => {
+            const selected = option.value === value;
+            return (
+              <button
+                key={String(option.value)}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                disabled={disabled}
+                onClick={() => onChange(option.value)}
+                title={option.hint}
+                className={cx(
+                  "h-8 rounded-md font-mono text-xs tracking-wide transition-all",
+                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400",
+                  "disabled:cursor-not-allowed disabled:opacity-60",
+                  selected
+                    ? "bg-indigo-500/25 text-indigo-100 shadow-[inset_0_0_0_1px_rgba(129,140,248,0.55),0_0_14px_-4px_rgba(129,140,248,0.7)]"
+                    : "text-slate-400 hover:bg-white/[0.04] hover:text-slate-200",
+                )}
+              >
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
+        {active && <p className="mt-1 text-[10px] text-slate-500">{active.hint}</p>}
+      </div>
+    </div>
   );
 }
 
