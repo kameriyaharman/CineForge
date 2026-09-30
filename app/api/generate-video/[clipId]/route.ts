@@ -17,6 +17,8 @@ import {
   markClipFailed,
 } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
+import { isTestRequest } from "@/lib/billing";
+import { TEST_VIDEO_DELAY_MS, archiveTestClip, sampleVideoPath } from "@/lib/test-mode";
 
 /**
  * GET    /api/generate-video/{clipId}  — progress; finalises the clip when Fal is done
@@ -192,6 +194,24 @@ export async function GET(
   // Still with Fal.
   const requestId = clip.providerRequestId;
   const ageMs = Date.now() - clip.createdAt.getTime();
+
+  // Test Mode: finish with the bundled sample clip after a short, visible wait.
+  if (isTestRequest(requestId)) {
+    if (ageMs < TEST_VIDEO_DELAY_MS) {
+      return respond(clip, { ...describe(clip), status: ageMs < 2_000 ? "IN_QUEUE" : "RENDERING" });
+    }
+    const publicPath = sampleVideoPath(await clipAspect(clip.id));
+    const claimed = await prisma.videoClip.updateMany({
+      where: { id: clip.id, status: "PROCESSING", rawVideoUrl: null },
+      data: { rawVideoUrl: publicPath, status: "COMPLETED", errorMessage: "Test Mode sample — no Fal credit used." },
+    });
+    if (claimed.count > 0) {
+      await archiveTestClip(clip.id, publicPath);
+      console.info(`[clip-status] clip ${clip.id} completed in TEST MODE`);
+    }
+    const refreshed = await loadOwnedClipById(clip.id);
+    return respond(refreshed ?? clip, describe(refreshed ?? clip));
+  }
   if (!requestId) {
     if (ageMs > 2 * 60 * 1000) {
       await markClipFailed(clip.id, "The render was never submitted to Fal.");
@@ -262,6 +282,11 @@ export async function GET(
   }
 }
 
+async function clipAspect(clipId: string): Promise<string | null> {
+  const row = await prisma.videoClip.findUnique({ where: { id: clipId }, select: { aspectRatio: true } });
+  return row?.aspectRatio ?? null;
+}
+
 async function loadOwnedClipById(clipId: string) {
   return prisma.videoClip.findUnique({ where: { id: clipId }, select: clipSelect });
 }
@@ -287,7 +312,7 @@ export async function DELETE(
     return respond(clip, describe(clip));
   }
 
-  if (clip.providerRequestId) {
+  if (clip.providerRequestId && !isTestRequest(clip.providerRequestId)) {
     try {
       await getFal().queue.cancel(HUNYUAN_T2V_ENDPOINT, { requestId: clip.providerRequestId });
     } catch (err) {

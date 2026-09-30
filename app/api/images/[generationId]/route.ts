@@ -10,7 +10,9 @@ import {
   parseImageOutput,
   type GeneratedImage,
 } from "@/lib/image-pipeline";
+import { isTestRequest } from "@/lib/billing";
 import { prisma } from "@/lib/prisma";
+import { TEST_IMAGE_DELAY_MS, finalizeTestGeneration } from "@/lib/test-mode";
 import { FalNotConfiguredError, getFal } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
 
@@ -157,6 +159,13 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ gene
   const requestId = gen.providerRequestId;
   const endpoint = falEndpointFor(gen.model as Parameters<typeof falEndpointFor>[0]);
 
+  // Test Mode: finish with sample images after a short, visible wait.
+  if (isTestRequest(requestId)) {
+    if (ageMs < TEST_IMAGE_DELAY_MS) return respond(gen, { status: "GENERATING" });
+    await finalizeTestGeneration(gen.id);
+    return respond((await load(gen.id)) ?? gen);
+  }
+
   if (!requestId) {
     if (ageMs > 2 * 60 * 1000) {
       await markGenerationFailed(gen.id, "The generation was never submitted to Fal.");
@@ -230,7 +239,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ g
     return errorResponse(500, "DATABASE_ERROR", "Could not load the generation.");
   }
   if (gen.status !== "PROCESSING") return respond(gen);
-  if (gen.providerRequestId) {
+  if (gen.providerRequestId && !isTestRequest(gen.providerRequestId)) {
     const endpoint = falEndpointFor(gen.model as Parameters<typeof falEndpointFor>[0]);
     await getFal()
       .queue.cancel(endpoint, { requestId: gen.providerRequestId })

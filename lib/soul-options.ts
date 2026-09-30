@@ -6,6 +6,12 @@
 
 export const SOUL_TRAINING_PRESETS = [
   {
+    value: "trial",
+    label: "Trial",
+    hint: "≈ $1 per hero · quick check that the face matches · lower quality",
+    priceLabel: "≈ $1",
+  },
+  {
     value: "fast",
     label: "Fast",
     hint: "≈ $2 per hero · a few minutes · good likeness",
@@ -59,6 +65,8 @@ export interface SoulHero {
   error: string | null;
   trainingStartedAt: string | null;
   trainingFinishedAt: string | null;
+  /** READY only in Test Mode — no real trained face yet. */
+  testOnly: boolean;
   createdAt: string;
 }
 

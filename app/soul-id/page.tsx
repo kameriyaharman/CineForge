@@ -18,6 +18,7 @@ import {
   X,
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
+import { refreshAccount, useAccount } from "@/components/account-control";
 import { SegmentedControl } from "@/components/segmented-control";
 import {
   SOUL_NAME_MAX,
@@ -92,7 +93,9 @@ export default function SoulIdPage() {
   const [creating, setCreating] = useState(false);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [preset, setPreset] = useState<SoulTrainingPreset>("fast");
+  const [preset, setPreset] = useState<SoulTrainingPreset>("trial");
+  const account = useAccount();
+  const testMode = account?.testMode ?? true;
   const [starting, setStarting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -295,12 +298,10 @@ export default function SoulIdPage() {
     if (!detail || detail.hero.id !== selectedId) return;
     const p = SOUL_TRAINING_PRESETS.find((x) => x.value === preset)!;
     const again = detail.hero.status === "READY" ? " This replaces the current trained face." : "";
-    if (
-      !window.confirm(
-        `Start ${p.label} training for ${detail.hero.name}?\n\nThis uses your Fal credit: ${p.priceLabel}.${again}`,
-      )
-    )
-      return;
+    const costLine = testMode
+      ? "Test Mode is on: this is a free practice run. No Fal credit is used and no real face is trained."
+      : `This uses your Fal credit: ${p.priceLabel}.`;
+    if (!window.confirm(`Start ${p.label} training for ${detail.hero.name}?\n\n${costLine}${again}`)) return;
     setStarting(true);
     try {
       const res = await fetch(`/api/soul-id/${detail.hero.id}/train`, {
@@ -311,6 +312,7 @@ export default function SoulIdPage() {
       if (handleAuth(res)) return;
       if (!res.ok) throw new Error(await readError(res));
       notify("info", "Training started", "You can leave this page — it keeps going.");
+      void refreshAccount();
       await loadDetail(detail.hero.id, true);
     } catch (err) {
       notify("error", "Could not start training", err instanceof Error ? err.message : undefined);
@@ -496,8 +498,14 @@ export default function SoulIdPage() {
                   <div className="flex items-center gap-3 text-sm">
                     <CheckCircle2 className="size-5 shrink-0 text-emerald-300" aria-hidden />
                     <div>
-                      <p className="text-emerald-100">Face trained and ready</p>
-                      <p className="text-xs text-slate-400">Trained {formatDate(hero.trainingFinishedAt)}</p>
+                      <p className="text-emerald-100">
+                        {hero.testOnly ? "Practice training done (Test Mode)" : "Face trained and ready"}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        {hero.testOnly
+                          ? "No real face was trained. Images will be samples until you train with Test Mode off."
+                          : `Trained ${formatDate(hero.trainingFinishedAt)}`}
+                      </p>
                     </div>
                   </div>
                   <Link
@@ -650,18 +658,20 @@ export default function SoulIdPage() {
                     ) : hero.status === "FAILED" ? (
                       <>
                         <RotateCcw className="size-4" aria-hidden />
-                        Train again ({SOUL_TRAINING_PRESETS.find((p) => p.value === preset)?.priceLabel})
+                        Train again ({testMode ? "free in Test Mode" : SOUL_TRAINING_PRESETS.find((p) => p.value === preset)?.priceLabel})
                       </>
                     ) : (
                       <>
                         <Fingerprint className="size-4" aria-hidden />
                         {hero.status === "READY" ? "Retrain" : "Start training"} (
-                        {SOUL_TRAINING_PRESETS.find((p) => p.value === preset)?.priceLabel})
+                        {testMode ? "free in Test Mode" : SOUL_TRAINING_PRESETS.find((p) => p.value === preset)?.priceLabel})
                       </>
                     )}
                   </button>
                   <p className="text-[11px] text-slate-500">
-                    Training uses your Fal credit once per run. You’ll be asked to confirm first.
+                    {testMode
+                      ? "Test Mode is on: training is a free practice run (about 20 seconds), no real face is trained."
+                      : "Training uses your Fal credit once per run. You’ll be asked to confirm first."}
                   </p>
                 </div>
               )}

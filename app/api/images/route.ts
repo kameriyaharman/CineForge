@@ -16,6 +16,15 @@ import { prisma } from "@/lib/prisma";
 import { FalNotConfiguredError, getFal, isFalConfigured } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
 import { loraLinkFor } from "@/lib/soul-id";
+import {
+  SpendLimitError,
+  TEST_PREFIX,
+  assertWithinLimit,
+  estimateImageCost,
+  isTestMode,
+  recordSpend,
+} from "@/lib/billing";
+import { TEST_LORA_KEY } from "@/lib/test-mode";
 import { isSoulLikeness } from "@/lib/soul-options";
 
 /**
@@ -124,12 +133,19 @@ function parseBody(raw: unknown): { ok: true; body: ParsedBody } | { ok: false; 
 }
 
 export async function POST(req: NextRequest) {
-  if (!isFalConfigured()) {
-    return errorResponse(500, "SERVER_MISCONFIGURED", "Image engine is not configured (FAL_KEY).");
-  }
-
   const session = verifySession(req);
   if (!session.ok) return errorResponse(session.status, session.code, session.message);
+
+  let testMode: boolean;
+  try {
+    testMode = await isTestMode(session.userId);
+  } catch (err) {
+    console.error("[images] could not read account:", err);
+    return errorResponse(500, "DATABASE_ERROR", "Could not load your account.");
+  }
+  if (!testMode && !isFalConfigured()) {
+    return errorResponse(500, "SERVER_MISCONFIGURED", "Image engine is not configured (FAL_KEY).");
+  }
 
   let raw: unknown;
   try {
@@ -154,7 +170,14 @@ export async function POST(req: NextRequest) {
       if (hero.soulStatus !== "READY" || !hero.loraKey || !hero.triggerWord) {
         return errorResponse(409, "HERO_NOT_READY", `${hero.characterName} hasn't finished training yet.`);
       }
-      lora = { url: await loraLinkFor(hero.loraKey), scale: body.likeness };
+      if (hero.loraKey === TEST_LORA_KEY && !testMode) {
+        return errorResponse(
+          409,
+          "HERO_TRAINED_IN_TEST_MODE",
+          `${hero.characterName} was only trained in Test Mode. Train it for real first (Soul ID page).`,
+        );
+      }
+      lora = testMode ? undefined : { url: await loraLinkFor(hero.loraKey), scale: body.likeness };
       finalPrompt = `photo of ${hero.triggerWord}, ${finalPrompt}`;
     } catch (err) {
       console.error("[images] hero lookup failed:", err);
@@ -191,6 +214,30 @@ export async function POST(req: NextRequest) {
     return errorResponse(500, "DATABASE_ERROR", "Could not start the generation.");
   }
 
+  // Test Mode: nothing goes to Fal; the status route returns sample images.
+  if (testMode) {
+    await prisma.imageGeneration.update({
+      where: { id: generationId },
+      data: { providerRequestId: `${TEST_PREFIX}${generationId}` },
+    });
+    console.info(`[images] generation ${generationId} started in TEST MODE (no Fal call)`);
+    return NextResponse.json(
+      { generationId, status: "IN_QUEUE", statusUrl: `/api/images/${generationId}`, finalPrompt, testMode: true },
+      { status: 202, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
+  const estimate = estimateImageCost(body.model, body.quality, body.numImages);
+  try {
+    await assertWithinLimit(session.userId, estimate);
+  } catch (err) {
+    if (err instanceof SpendLimitError) {
+      await markGenerationFailed(generationId, err.message);
+      return errorResponse(402, "SPEND_LIMIT_REACHED", err.message);
+    }
+    throw err;
+  }
+
   const endpoint = falEndpointFor(body.model);
   const input = buildFalInput({
     model: body.model,
@@ -205,6 +252,13 @@ export async function POST(req: NextRequest) {
   try {
     const { request_id: requestId } = await getFal().queue.submit(endpoint, { input });
     await prisma.imageGeneration.update({ where: { id: generationId }, data: { providerRequestId: requestId } });
+    await recordSpend(
+      session.userId,
+      "IMAGE",
+      generationId,
+      estimate,
+      `${getImageModel(body.model)?.label ?? body.model} × ${body.numImages}${body.quality ? ` · ${body.quality}` : ""}`,
+    );
     console.info(
       `[images] generation ${generationId} submitted as Fal ${requestId} · ${body.model} · ${body.aspectRatio} · x${body.numImages}${body.quality ? ` · ${body.quality}` : ""} · style=${body.styleId}${body.characterId ? ` · soul=${body.characterId} @${body.likeness}` : ""}`,
     );

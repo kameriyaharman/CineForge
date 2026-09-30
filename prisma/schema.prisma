@@ -54,6 +54,10 @@ model User {
   id        String   @id @default(uuid()) @db.Uuid
   email     String   @unique @db.VarChar(320)
   name      String?  @db.VarChar(120)
+  /// When on, nothing is sent to Fal: the app returns sample results for free.
+  testMode        Boolean  @default(true) @map("test_mode")
+  /// Paid work stops once this month's estimated spend would pass this (USD). Null = no limit.
+  monthlyLimitUsd Float?   @map("monthly_limit_usd")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -61,6 +65,7 @@ model User {
   projects         Project[]
   assets           Asset[]
   imageGenerations ImageGeneration[]
+  spend            SpendLog[]
 
   @@map("users")
 }
@@ -234,4 +239,22 @@ model CharacterPhoto {
 
   @@index([characterId, createdAt])
   @@map("character_photos")
+}
+
+/// Estimated provider cost of each paid request, for the spend meter and monthly limit.
+model SpendLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  /// IMAGE | VIDEO | TRAINING
+  kind        String   @db.VarChar(20)
+  /// Generation, clip or character id.
+  refId       String?  @map("ref_id") @db.Uuid
+  amountUsd   Float    @map("amount_usd")
+  description String   @db.VarChar(200)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("spend_log")
 }

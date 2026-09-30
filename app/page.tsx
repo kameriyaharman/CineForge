@@ -32,6 +32,7 @@ import {
   X,
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
+import { refreshAccount } from "@/components/account-control";
 import {
   ASPECT_RATIO_OPTIONS,
   DEFAULT_RENDER_SETTINGS,
@@ -549,6 +550,7 @@ export default function CineForgeStudioPage() {
         }
         activeClipIdRef.current = accepted.clipId;
         setPhase("IN_QUEUE");
+        void refreshAccount();
 
         // 2. Poll until the video is ready or the render fails.
         let failures = 0;

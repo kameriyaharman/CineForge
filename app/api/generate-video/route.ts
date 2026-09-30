@@ -21,6 +21,7 @@ import {
   type HunyuanVideoInput,
 } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
+import { PRICES, SpendLimitError, TEST_PREFIX, assertWithinLimit, isTestMode, recordSpend } from "@/lib/billing";
 
 /* -------------------------------------------------------------------------- */
 /*                                   Config                                   */
@@ -94,6 +95,8 @@ interface GenerateVideoAccepted {
   cameraMovement: CameraMovement | null;
   character: { id: string; characterName: string } | null;
   identityMode: IdentityPlan["mode"];
+  /** True when made in Test Mode (sample clip, no Fal call). */
+  testMode?: boolean;
 }
 
 interface GenerateVideoError {
@@ -349,17 +352,32 @@ async function resolveProjectId(userId: string, requested: string | null): Promi
 export async function POST(
   req: NextRequest,
 ): Promise<NextResponse<GenerateVideoAccepted | GenerateVideoError>> {
-  if (!isFalConfigured()) {
-    console.error("[generate-video] FAL_KEY is not set in this deployment's environment.");
-    return errorResponse(500, "SERVER_MISCONFIGURED", "Video engine is not configured.");
-  }
-
   // 1. Session — who is rendering.
   const session = verifySession(req);
   if (!session.ok) {
     return errorResponse(session.status, session.code, session.message);
   }
   const userId = session.userId;
+
+  let testMode: boolean;
+  try {
+    testMode = await isTestMode(userId);
+  } catch (err) {
+    console.error("[generate-video] could not read account:", err);
+    return errorResponse(500, "DATABASE_ERROR", "Could not load your account.");
+  }
+  if (!testMode && !isFalConfigured()) {
+    console.error("[generate-video] FAL_KEY is not set in this deployment's environment.");
+    return errorResponse(500, "SERVER_MISCONFIGURED", "Video engine is not configured.");
+  }
+  if (!testMode) {
+    try {
+      await assertWithinLimit(userId, PRICES.video.hunyuan);
+    } catch (err) {
+      if (err instanceof SpendLimitError) return errorResponse(402, "SPEND_LIMIT_REACHED", err.message);
+      throw err;
+    }
+  }
 
   // 2. Body.
   let body: unknown;
@@ -441,6 +459,29 @@ export async function POST(
     enable_safety_checker: true,
   };
 
+  // Test Mode: no Fal call; the status route finishes with a sample clip.
+  if (testMode) {
+    const requestId = `${TEST_PREFIX}${clipId}`;
+    await prisma.videoClip.update({ where: { id: clipId }, data: { providerRequestId: requestId } });
+    console.info(`[generate-video] clip ${clipId} started in TEST MODE (no Fal call)`);
+    return NextResponse.json(
+      {
+        clipId,
+        settings,
+        projectId,
+        requestId,
+        status: "IN_QUEUE",
+        statusUrl: `/api/generate-video/${clipId}`,
+        finalPrompt,
+        cameraMovement,
+        character: character ? { id: character.id, characterName: character.characterName } : null,
+        identityMode: identity.mode,
+        testMode: true,
+      },
+      { status: 202, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
   // 4. Submit to Fal's queue — returns in about a second.
   try {
     const { request_id: requestId } = await getFal().queue.submit(HUNYUAN_T2V_ENDPOINT, { input });
@@ -449,6 +490,13 @@ export async function POST(
       where: { id: clipId },
       data: { providerRequestId: requestId },
     });
+    await recordSpend(
+      userId,
+      "VIDEO",
+      clipId,
+      PRICES.video.hunyuan,
+      `Hunyuan video · ${settings.resolution} · ${settings.numFrames} frames`,
+    );
 
     console.info(
       `[generate-video] clip ${clipId} submitted as Fal ${requestId} · ${settings.resolution} · ${settings.numFrames} frames · ${settings.aspectRatio} · character=${character?.characterName ?? "none"} · identity=${identity.mode}`,

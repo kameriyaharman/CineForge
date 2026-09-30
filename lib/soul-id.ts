@@ -2,7 +2,17 @@ import { randomBytes } from "node:crypto";
 import { PassThrough } from "node:stream";
 import { ApiError } from "@fal-ai/client";
 import archiver from "archiver";
+import {
+  SpendLimitError,
+  TEST_PREFIX,
+  assertWithinLimit,
+  estimateTrainingCost,
+  isTestMode,
+  isTestRequest,
+  recordSpend,
+} from "@/lib/billing";
 import { prisma } from "@/lib/prisma";
+import { TEST_LORA_KEY, TEST_TRAINING_DELAY_MS } from "@/lib/test-mode";
 import { getFal } from "@/lib/render-pipeline";
 import type { SoulHero, SoulTrainingPreset } from "@/lib/soul-options";
 import { SOUL_PHOTO_MIN, isSoulTrainingPreset } from "@/lib/soul-options";
@@ -23,6 +33,17 @@ import {
  */
 
 const TRAINERS: Record<SoulTrainingPreset, { endpoint: string; input: (zipUrl: string, trigger: string) => Record<string, unknown> }> = {
+  // Fal bills fast training linearly by steps ($2 at 1000), so 500 steps ≈ $1.
+  trial: {
+    endpoint: "fal-ai/flux-lora-fast-training",
+    input: (zipUrl, trigger) => ({
+      images_data_url: zipUrl,
+      trigger_word: trigger,
+      create_masks: true,
+      is_style: false,
+      steps: 500,
+    }),
+  },
   fast: {
     endpoint: "fal-ai/flux-lora-fast-training",
     input: (zipUrl, trigger) => ({
@@ -118,6 +139,7 @@ export async function toSoulHero(row: HeroRow): Promise<SoulHero> {
     error: row.trainingError,
     trainingStartedAt: row.trainingStartedAt?.toISOString() ?? null,
     trainingFinishedAt: row.trainingFinishedAt?.toISOString() ?? null,
+    testOnly: row.loraKey === TEST_LORA_KEY,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -170,6 +192,16 @@ export async function startTraining(characterId: string, userId: string, preset:
     throw new SoulError(422, "NOT_ENOUGH_PHOTOS", `Add at least ${SOUL_PHOTO_MIN} photos before training.`);
   }
 
+  const testMode = await isTestMode(userId);
+  if (!testMode) {
+    try {
+      await assertWithinLimit(userId, estimateTrainingCost(preset));
+    } catch (err) {
+      if (err instanceof SpendLimitError) throw new SoulError(402, "SPEND_LIMIT_REACHED", err.message);
+      throw err;
+    }
+  }
+
   const trigger = hero.triggerWord ?? newTriggerWord();
   const claimed = await prisma.character.updateMany({
     where: { id: characterId, userId, soulStatus: { not: "TRAINING" } },
@@ -185,6 +217,15 @@ export async function startTraining(characterId: string, userId: string, preset:
   });
   if (claimed.count === 0) throw new SoulError(409, "ALREADY_TRAINING", "This hero is already training.");
 
+  if (testMode) {
+    await prisma.character.update({
+      where: { id: characterId },
+      data: { trainingRequestId: `${TEST_PREFIX}${characterId}-${Date.now()}` },
+    });
+    console.info(`[soul-id] hero ${characterId} training started in TEST MODE (no Fal call)`);
+    return;
+  }
+
   try {
     const key = await buildTrainingZip(userId, characterId);
     const zipUrl = await presignGet(key, undefined, TRAINING_LINK_TTL_S);
@@ -193,6 +234,13 @@ export async function startTraining(characterId: string, userId: string, preset:
       input: trainer.input(zipUrl, trigger),
     });
     await prisma.character.update({ where: { id: characterId }, data: { trainingRequestId: requestId } });
+    await recordSpend(
+      userId,
+      "TRAINING",
+      characterId,
+      estimateTrainingCost(preset),
+      `Soul ID training · ${hero.characterName} · ${preset}`,
+    );
     console.info(
       `[soul-id] hero ${characterId} training submitted as Fal ${requestId} · ${preset} · ${hero._count.photos} photos`,
     );
@@ -233,6 +281,22 @@ export async function refreshTraining(hero: HeroRow): Promise<HeroRow> {
   const endpoint = TRAINERS[isSoulTrainingPreset(hero.soulPreset) ? hero.soulPreset : "fast"].endpoint;
   const age = Date.now() - (hero.trainingStartedAt?.getTime() ?? hero.createdAt.getTime());
 
+  // Test Mode: "finishes" after a short wait with no real face file.
+  if (isTestRequest(hero.trainingRequestId)) {
+    if (age < TEST_TRAINING_DELAY_MS) return hero;
+    await prisma.character.updateMany({
+      where: { id: hero.id, soulStatus: "TRAINING", trainingRequestId: hero.trainingRequestId },
+      data: {
+        soulStatus: "READY",
+        // Keep a real face file from an earlier live training if there is one.
+        loraKey: hero.loraKey && hero.loraKey !== TEST_LORA_KEY ? hero.loraKey : TEST_LORA_KEY,
+        trainingError: null,
+        trainingFinishedAt: new Date(),
+      },
+    });
+    return (await loadHero(hero.id, hero.userId)) ?? hero;
+  }
+
   try {
     if (!hero.trainingRequestId) {
       // Zipping/submitting happens inside the start request; a long gap means it died.
@@ -270,7 +334,7 @@ export async function refreshTraining(hero: HeroRow): Promise<HeroRow> {
     // Keep our own copy — provider links expire.
     const key = `${soulPrefix(hero.userId, hero.id)}/lora-${Date.now()}.safetensors`;
     await archiveFromUrl(loraUrl, key, "application/octet-stream");
-    const previous = hero.loraKey;
+    const previous = hero.loraKey === TEST_LORA_KEY ? null : hero.loraKey;
     const updated = await prisma.character.updateMany({
       where: { id: hero.id, soulStatus: "TRAINING", trainingRequestId: hero.trainingRequestId },
       data: { soulStatus: "READY", loraKey: key, trainingError: null, trainingFinishedAt: new Date() },
@@ -304,6 +368,6 @@ export async function loraLinkFor(loraKey: string): Promise<string> {
 /** Removes every stored file for the hero (photos, zip, LoRA). */
 export async function deleteHeroFiles(userId: string, characterId: string, loraKey: string | null): Promise<void> {
   const photos = await prisma.characterPhoto.findMany({ where: { characterId }, select: { storageKey: true } });
-  const keys = [...photos.map((p) => p.storageKey), zipKey(userId, characterId), ...(loraKey ? [loraKey] : [])];
+  const keys = [...photos.map((p) => p.storageKey), zipKey(userId, characterId), ...(loraKey && loraKey !== TEST_LORA_KEY ? [loraKey] : [])];
   await Promise.all(keys.map((k) => deleteObject(k).catch(() => undefined)));
 }

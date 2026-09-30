@@ -107,6 +107,7 @@ function formatDate(iso: string): string {
 
 function badgesFor(asset: LibraryAsset): string[] {
   const badges: string[] = [];
+  if (asset.meta?.testMode === true) badges.push("Test sample");
   if (asset.role === "UPSCALE") badges.push("Upscaled");
   const res = metaString(asset.meta, "resolution");
   if (res) badges.push(/k$/i.test(res) ? res.toUpperCase() : res);

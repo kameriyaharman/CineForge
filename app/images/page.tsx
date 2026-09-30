@@ -45,6 +45,8 @@ import {
   type ImageSettings,
 } from "@/lib/image-models";
 import { SOUL_LIKENESS_OPTIONS, type SoulHero } from "@/lib/soul-options";
+import { estimateImageCost } from "@/lib/prices";
+import { formatInr, formatUsd, refreshAccount, useAccount } from "@/components/account-control";
 
 /* -------------------------------------------------------------------------- */
 /*                                    Types                                   */
@@ -364,6 +366,7 @@ export default function ImageStudioPage() {
         throw new Error(errorText(data, res.status));
       }
       const generationId = (data as { generationId: string }).generationId;
+      void refreshAccount();
       generationRef.current = generationId;
 
       const started = Date.now();
@@ -565,7 +568,14 @@ export default function ImageStudioPage() {
                         {h.id !== null &&
                           (h.coverUrl ? (
                             // eslint-disable-next-line @next/next/no-img-element
-                            <img src={h.coverUrl} alt="" className="size-7 rounded-full object-cover" />
+                            <img
+                              src={h.coverUrl}
+                              alt=""
+                              className="size-7 rounded-full object-cover"
+                              onError={(e) => {
+                                e.currentTarget.style.visibility = "hidden";
+                              }}
+                            />
                           ) : (
                             <span className="flex size-7 items-center justify-center rounded-full bg-indigo-500/20 text-[10px] font-semibold">
                               {h.name.slice(0, 2).toUpperCase()}
@@ -753,6 +763,7 @@ export default function ImageStudioPage() {
                 Generate {settings.numImages > 1 ? `${settings.numImages} images` : "image"}
               </button>
             )}
+            <CostLine usd={estimateImageCost(settings.model, settings.quality, settings.numImages)} />
           </form>
         </section>
 
@@ -1010,5 +1021,18 @@ function Viewer({ viewing, onClose }: { viewing: Viewing; onClose: () => void })
         </div>
       </div>
     </div>
+  );
+}
+
+/** "Free sample in Test Mode" or the estimated Fal cost of this run. */
+function CostLine({ usd }: { usd: number }) {
+  const account = useAccount();
+  if (!account) return null;
+  return account.testMode ? (
+    <p className="text-center text-[11px] text-amber-200/80">Test Mode · free sample, no Fal credit used</p>
+  ) : (
+    <p className="text-center text-[11px] text-slate-500">
+      Estimated Fal cost: {formatUsd(usd)} ({formatInr(usd)})
+    </p>
   );
 }
