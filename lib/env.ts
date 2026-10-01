@@ -42,7 +42,7 @@ const OPTIONAL: EnvRule[] = [
   { name: "S3_BUCKET", reason: "asset library storage — without it renders keep only expiring provider links" },
   {
     name: "REPLICATE_API_TOKEN",
-    reason: "Soul ID face step (IP-Adapter-FaceID) — not wired yet, so nothing uses it today",
+    reason: "Budget image model and Budget prompt edit (FLUX.2 Klein) — without it those two options fail; Fal models still work",
   },
 ];
 

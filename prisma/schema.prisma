@@ -210,6 +210,8 @@ model ImageGeneration {
   characterId       String?    @map("character_id") @db.Uuid
   /// LoRA strength used with the Soul ID.
   loraScale         Float?     @map("lora_scale")
+  /// Edits: the Library image that was edited / upscaled.
+  sourceAssetId     String?    @map("source_asset_id") @db.Uuid
   /// Provider output: [{ url, width, height, contentType }]
   outputs           Json?
   errorMessage      String?    @map("error_message") @db.Text

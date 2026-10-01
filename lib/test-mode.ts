@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { Prisma } from "@/lib/generated/prisma/client";
+import { getEditTool } from "@/lib/edit-tools";
 import { getImageModel } from "@/lib/image-models";
 import { prisma } from "@/lib/prisma";
 import { isStorageConfigured, uploadReadable } from "@/lib/storage";
@@ -86,12 +87,13 @@ export async function finalizeTestGeneration(generationId: string): Promise<void
       stylePreset: true,
       loraScale: true,
       characterId: true,
+      sourceAssetId: true,
       createdAt: true,
       character: { select: { characterName: true } },
     },
   });
   if (!gen) return;
-  const modelLabel = getImageModel(gen.model)?.label ?? gen.model;
+  const modelLabel = getImageModel(gen.model)?.label ?? getEditTool(gen.model)?.label ?? gen.model;
   const heroName = gen.character?.characterName ?? null;
   const samples = Array.from({ length: gen.numImages }, (_, index) =>
     sampleImageSvg({ aspectRatio: gen.aspectRatio, prompt: gen.prompt, modelLabel, heroName, index }),
@@ -137,6 +139,8 @@ export async function finalizeTestGeneration(generationId: string): Promise<void
               characterName: heroName,
               characterId: gen.characterId,
               likeness: gen.loraScale,
+              editOf: gen.sourceAssetId,
+              tool: gen.sourceAssetId ? gen.model : null,
             } satisfies Prisma.InputJsonObject,
           },
         });

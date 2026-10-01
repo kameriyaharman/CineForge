@@ -12,6 +12,7 @@ import {
   Play,
   Sparkles,
   Trash2,
+  Wand2,
   X,
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
@@ -108,6 +109,16 @@ function formatDate(iso: string): string {
 function badgesFor(asset: LibraryAsset): string[] {
   const badges: string[] = [];
   if (asset.meta?.testMode === true) badges.push("Test sample");
+  if (asset.role === "UPLOAD") badges.push("Uploaded");
+  const tool = metaString(asset.meta, "tool");
+  if (tool) {
+    // Edits: just say what was done.
+    const q = metaString(asset.meta, "quality");
+    if (tool === "upscale") badges.push(`Upscaled ${q ?? ""}×`.replace(" ×", "×"));
+    else if (tool === "remove-bg") badges.push("Cut-out");
+    else badges.push(tool === "edit-nano" ? "Edited · Pro" : "Edited · Budget");
+    return badges;
+  }
   if (asset.role === "UPSCALE") badges.push("Upscaled");
   const res = metaString(asset.meta, "resolution");
   if (res) badges.push(/k$/i.test(res) ? res.toUpperCase() : res);
@@ -441,6 +452,16 @@ function AssetCard({
             {formatDate(asset.createdAt)}
           </p>
           <div className="flex shrink-0 gap-1">
+            {asset.kind === "IMAGE" && (
+              <Link
+                href={`/edit?asset=${asset.id}`}
+                aria-label="Edit"
+                title="Edit, upscale or remove background"
+                className="flex size-8 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-100"
+              >
+                <Wand2 className="size-4" aria-hidden />
+              </Link>
+            )}
             <a
               href={`/api/assets/${asset.id}?download=1`}
               aria-label="Download"

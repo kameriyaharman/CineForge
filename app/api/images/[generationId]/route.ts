@@ -1,6 +1,7 @@
 import { ApiError } from "@fal-ai/client";
 import { NextResponse, type NextRequest } from "next/server";
 import { assetUrl } from "@/lib/assets";
+import { getEditTool } from "@/lib/edit-tools";
 import { getImageModel } from "@/lib/image-models";
 import {
   IMAGE_TIMEOUT_MS,
@@ -8,10 +9,19 @@ import {
   finalizeGeneration,
   markGenerationFailed,
   parseImageOutput,
+  replicateImages,
   type GeneratedImage,
 } from "@/lib/image-pipeline";
 import { isTestRequest } from "@/lib/billing";
 import { prisma } from "@/lib/prisma";
+import {
+  ReplicateError,
+  ReplicateNotConfiguredError,
+  cancelPrediction,
+  decodeReplicateIds,
+  getPrediction,
+  outputUrls,
+} from "@/lib/replicate";
 import { TEST_IMAGE_DELAY_MS, finalizeTestGeneration } from "@/lib/test-mode";
 import { FalNotConfiguredError, getFal } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
@@ -117,7 +127,7 @@ async function respond(gen: Generation, overrides: Partial<GenerationStatus> = {
     images,
     requested: gen.numImages,
     model: gen.model,
-    modelLabel: getImageModel(gen.model)?.label ?? gen.model,
+    modelLabel: getImageModel(gen.model)?.label ?? getEditTool(gen.model)?.label ?? gen.model,
     aspectRatio: gen.aspectRatio,
     quality: gen.quality,
     seed: gen.seed,
@@ -157,7 +167,6 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ gene
 
   const ageMs = Date.now() - gen.createdAt.getTime();
   const requestId = gen.providerRequestId;
-  const endpoint = falEndpointFor(gen.model as Parameters<typeof falEndpointFor>[0]);
 
   // Test Mode: finish with sample images after a short, visible wait.
   if (isTestRequest(requestId)) {
@@ -174,6 +183,11 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ gene
     return respond(gen, { status: "IN_QUEUE" });
   }
 
+  // Replicate (Budget model): one prediction per image.
+  const replicateIds = decodeReplicateIds(requestId);
+  if (replicateIds) return pollReplicate(gen, replicateIds, ageMs);
+
+  const endpoint = falEndpointFor(gen.model as Parameters<typeof falEndpointFor>[0]);
   try {
     const fal = getFal();
     const status = await fal.queue.status(endpoint, { requestId, logs: false });
@@ -228,6 +242,46 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ gene
   }
 }
 
+async function pollReplicate(gen: Generation, ids: string[], ageMs: number) {
+  try {
+    const predictions = await Promise.all(ids.map((id) => getPrediction(id)));
+    const running = predictions.filter((p) => p.status === "starting" || p.status === "processing");
+    if (running.length > 0) {
+      if (ageMs > IMAGE_TIMEOUT_MS) {
+        await Promise.all(running.map((p) => cancelPrediction(p.id).catch(() => undefined)));
+        await markGenerationFailed(gen.id, "The image model took over 10 minutes, so the job was cancelled.");
+        return respond((await load(gen.id)) ?? gen);
+      }
+      const queued = predictions.every((p) => p.status === "starting");
+      return respond(gen, { status: queued ? "IN_QUEUE" : "GENERATING" });
+    }
+    const images = replicateImages(
+      predictions.filter((p) => p.status === "succeeded").flatMap((p) => outputUrls(p.output)),
+    );
+    if (images.length === 0) {
+      const reason = predictions.find((p) => p.error)?.error;
+      console.error(`[images] generation ${gen.id} Replicate failed:`, predictions.map((p) => [p.status, p.error]));
+      await markGenerationFailed(
+        gen.id,
+        `The model returned no image${reason ? `: ${reason.slice(0, 300)}` : "."}`,
+      );
+      return respond((await load(gen.id)) ?? gen);
+    }
+    await finalizeGeneration(gen.id, images, null);
+    return respond((await load(gen.id)) ?? gen);
+  } catch (err) {
+    if (err instanceof ReplicateNotConfiguredError) {
+      return errorResponse(500, "REPLICATE_NOT_CONFIGURED", "REPLICATE_API_TOKEN is not set.");
+    }
+    if (err instanceof ReplicateError && err.status === 404) {
+      await markGenerationFailed(gen.id, "Replicate no longer knows this job.");
+      return respond((await load(gen.id)) ?? gen);
+    }
+    console.error(`[images] Replicate status error for ${gen.id}:`, err);
+    return errorResponse(502, "PROVIDER_ERROR", "Could not reach the image model. Retrying…");
+  }
+}
+
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ generationId: string }> }) {
   let gen: Generation;
   try {
@@ -239,7 +293,10 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ g
     return errorResponse(500, "DATABASE_ERROR", "Could not load the generation.");
   }
   if (gen.status !== "PROCESSING") return respond(gen);
-  if (gen.providerRequestId && !isTestRequest(gen.providerRequestId)) {
+  const repIds = decodeReplicateIds(gen.providerRequestId);
+  if (repIds) {
+    await Promise.all(repIds.map((id) => cancelPrediction(id).catch(() => undefined)));
+  } else if (gen.providerRequestId && !isTestRequest(gen.providerRequestId)) {
     const endpoint = falEndpointFor(gen.model as Parameters<typeof falEndpointFor>[0]);
     await getFal()
       .queue.cancel(endpoint, { requestId: gen.providerRequestId })

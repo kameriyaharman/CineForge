@@ -51,6 +51,20 @@ export interface ImageModel {
 
 export const IMAGE_MODELS = [
   {
+    id: "flux-2-klein",
+    label: "FLUX.2 Klein · Budget",
+    vendor: "Black Forest Labs · via Replicate",
+    tagline: "Cheapest — great for drafts and exploring ideas",
+    priceLabel: "≈ $0.001 / image (≈ ₹0.09) at 1 MP",
+    speedLabel: "~2 s",
+    aspects: ["16:9", "21:9", "4:3", "1:1", "3:4", "9:16"],
+    qualities: [
+      { value: "1", label: "1 MP", hint: "Draft size · ≈ ₹0.09 per image" },
+      { value: "2", label: "2 MP", hint: "Sharper · ≈ ₹0.18 per image" },
+      { value: "4", label: "4 MP", hint: "Largest · ≈ ₹0.35 per image" },
+    ],
+  },
+  {
     id: "flux-2-flash",
     label: "FLUX.2 Flash",
     vendor: "Black Forest Labs",
@@ -180,7 +194,7 @@ export interface ImageSettings {
 }
 
 export const DEFAULT_IMAGE_SETTINGS: ImageSettings = {
-  model: "flux-2-flash",
+  model: "flux-2-klein",
   aspectRatio: "16:9",
   numImages: 2,
   style: "cinematic",

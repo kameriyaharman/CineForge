@@ -860,6 +860,16 @@ export default function ImageStudioPage() {
                         <Download className="size-4" aria-hidden />
                         <span className="sr-only">Download</span>
                       </a>
+                      {img.assetId && (
+                        <Link
+                          href={`/edit?asset=${img.assetId}`}
+                          className="pointer-events-auto flex size-9 items-center justify-center rounded-lg border border-white/15 bg-black/60 text-slate-200 backdrop-blur hover:border-indigo-400/60"
+                          title="Edit, upscale or remove background"
+                        >
+                          <Wand2 className="size-4" aria-hidden />
+                          <span className="sr-only">Edit</span>
+                        </Link>
+                      )}
                     </div>
                   </figure>
                 ))}

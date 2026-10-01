@@ -5,7 +5,7 @@ import { verifySession } from "@/lib/session";
 import { deleteObject } from "@/lib/storage";
 
 /**
- * GET    /api/assets/{id}            → redirects to a short-lived link (?download=1 saves the file)
+ * GET    /api/assets/{id}            → redirects to a short-lived link (?download=1 saves the file, ?info=1 returns JSON)
  * DELETE /api/assets/{id}            → removes the file from the bucket and the library
  */
 
@@ -26,7 +26,18 @@ async function loadOwned(req: NextRequest, params: Promise<{ assetId: string }>)
   if (!UUID_PATTERN.test(assetId)) return { response: error(400, "INVALID_ASSET_ID", "Malformed asset id.") } as const;
   const asset = await prisma.asset.findFirst({
     where: { id: assetId.toLowerCase(), userId: session.userId },
-    select: { id: true, storageKey: true, kind: true, contentType: true, createdAt: true },
+    select: {
+      id: true,
+      storageKey: true,
+      kind: true,
+      role: true,
+      contentType: true,
+      byteSize: true,
+      prompt: true,
+      meta: true,
+      clipId: true,
+      createdAt: true,
+    },
   });
   if (!asset) return { response: error(404, "ASSET_NOT_FOUND", "File not found.") } as const;
   return { asset } as const;
@@ -37,6 +48,26 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ asse
     const loaded = await loadOwned(req, params);
     if ("response" in loaded) return loaded.response;
     const { asset } = loaded;
+    // ?info=1 → the asset's details as JSON (same shape as the library list).
+    if (req.nextUrl.searchParams.get("info") === "1") {
+      return NextResponse.json(
+        {
+          asset: {
+            id: asset.id,
+            kind: asset.kind,
+            role: asset.role,
+            url: await assetUrl(asset.storageKey),
+            contentType: asset.contentType,
+            byteSize: asset.byteSize !== null ? Number(asset.byteSize) : null,
+            prompt: asset.prompt,
+            meta: asset.meta,
+            clipId: asset.clipId,
+            createdAt: asset.createdAt.toISOString(),
+          },
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
     const download = req.nextUrl.searchParams.get("download") === "1";
     const ext = asset.storageKey.split(".").pop() ?? (asset.kind === "VIDEO" ? "mp4" : "png");
     const name = `cineforge-${asset.createdAt.toISOString().slice(0, 10)}-${asset.id.slice(0, 8)}.${ext}`;

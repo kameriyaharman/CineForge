@@ -3,12 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { Aperture, Clapperboard, Fingerprint, FolderOpen, ImageIcon } from "lucide-react";
+import { Aperture, Clapperboard, Fingerprint, FolderOpen, ImageIcon, Wand2 } from "lucide-react";
 import { AccountControl, TestModeBanner } from "@/components/account-control";
 
 const NAV = [
   { href: "/soul-id", label: "Soul ID", icon: Fingerprint },
   { href: "/images", label: "Images", icon: ImageIcon },
+  { href: "/edit", label: "Edit", icon: Wand2 },
   { href: "/", label: "Video", icon: Clapperboard },
   { href: "/library", label: "Library", icon: FolderOpen },
 ] as const;

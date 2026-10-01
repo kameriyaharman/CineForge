@@ -1,5 +1,6 @@
 import { Prisma } from "@/lib/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
+import { getEditTool } from "@/lib/edit-tools";
 import { getImageModel, getStylePreset } from "@/lib/image-models";
 import type { GeneratedImage } from "@/lib/image-pipeline";
 import { archiveFromUrl, isStorageConfigured, presignGet } from "@/lib/storage";
@@ -120,12 +121,13 @@ export async function archiveGenerationImages(generationId: string, images: Gene
         loraScale: true,
         createdAt: true,
         characterId: true,
+        sourceAssetId: true,
         character: { select: { characterName: true } },
       },
     });
     if (!gen) return;
     const stamp = gen.createdAt.toISOString().slice(0, 10);
-    const model = getImageModel(gen.model);
+    const model = getImageModel(gen.model) ?? getEditTool(gen.model);
     const style = getStylePreset(gen.stylePreset);
 
     await Promise.all(
@@ -159,6 +161,8 @@ export async function archiveGenerationImages(generationId: string, images: Gene
                 index: index + 1,
                 characterName: gen.character?.characterName ?? null,
                 characterId: gen.characterId,
+                editOf: gen.sourceAssetId,
+                tool: gen.sourceAssetId ? gen.model : null,
                 likeness: gen.loraScale,
               } satisfies Prisma.InputJsonObject,
             },

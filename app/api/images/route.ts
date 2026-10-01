@@ -1,4 +1,3 @@
-import { ApiError, ValidationError } from "@fal-ai/client";
 import { NextResponse, type NextRequest } from "next/server";
 import {
   IMAGE_PROMPT_MAX,
@@ -11,9 +10,11 @@ import {
   type ImageAspectRatio,
   type ImageModelId,
 } from "@/lib/image-models";
-import { buildFalInput, falEndpointFor, markGenerationFailed } from "@/lib/image-pipeline";
+import { markGenerationFailed, providerFor, submitToProvider } from "@/lib/image-pipeline";
+import { handleSubmitError } from "@/lib/job-errors";
+import { isReplicateConfigured } from "@/lib/replicate";
 import { prisma } from "@/lib/prisma";
-import { FalNotConfiguredError, getFal, isFalConfigured } from "@/lib/render-pipeline";
+import { isFalConfigured } from "@/lib/render-pipeline";
 import { verifySession } from "@/lib/session";
 import { loraLinkFor } from "@/lib/soul-id";
 import {
@@ -143,9 +144,6 @@ export async function POST(req: NextRequest) {
     console.error("[images] could not read account:", err);
     return errorResponse(500, "DATABASE_ERROR", "Could not load your account.");
   }
-  if (!testMode && !isFalConfigured()) {
-    return errorResponse(500, "SERVER_MISCONFIGURED", "Image engine is not configured (FAL_KEY).");
-  }
 
   let raw: unknown;
   try {
@@ -156,6 +154,19 @@ export async function POST(req: NextRequest) {
   const parsed = parseBody(raw);
   if (!parsed.ok) return errorResponse(400, "INVALID_BODY", parsed.message);
   const body = parsed.body;
+  if (!testMode) {
+    const provider = providerFor(body.model);
+    if (provider === "fal" && !isFalConfigured()) {
+      return errorResponse(500, "SERVER_MISCONFIGURED", "Image engine is not configured (FAL_KEY).");
+    }
+    if (provider === "replicate" && !isReplicateConfigured()) {
+      return errorResponse(
+        500,
+        "REPLICATE_NOT_CONFIGURED",
+        "The Budget model needs a Replicate API token (REPLICATE_API_TOKEN on Railway). Pick another model meanwhile.",
+      );
+    }
+  }
   let finalPrompt = buildImagePrompt(body.prompt, getStylePreset(body.styleId));
 
   // Soul ID: the hero must be trained, and the prompt carries its trigger word.
@@ -238,19 +249,16 @@ export async function POST(req: NextRequest) {
     throw err;
   }
 
-  const endpoint = falEndpointFor(body.model);
-  const input = buildFalInput({
-    model: body.model,
-    prompt: finalPrompt,
-    aspectRatio: body.aspectRatio,
-    numImages: body.numImages,
-    quality: body.quality,
-    seed: body.seed,
-    lora,
-  });
-
   try {
-    const { request_id: requestId } = await getFal().queue.submit(endpoint, { input });
+    const requestId = await submitToProvider({
+      model: body.model,
+      prompt: finalPrompt,
+      aspectRatio: body.aspectRatio,
+      numImages: body.numImages,
+      quality: body.quality,
+      seed: body.seed,
+      lora,
+    });
     await prisma.imageGeneration.update({ where: { id: generationId }, data: { providerRequestId: requestId } });
     await recordSpend(
       session.userId,
@@ -260,38 +268,14 @@ export async function POST(req: NextRequest) {
       `${getImageModel(body.model)?.label ?? body.model} × ${body.numImages}${body.quality ? ` · ${body.quality}` : ""}`,
     );
     console.info(
-      `[images] generation ${generationId} submitted as Fal ${requestId} · ${body.model} · ${body.aspectRatio} · x${body.numImages}${body.quality ? ` · ${body.quality}` : ""} · style=${body.styleId}${body.characterId ? ` · soul=${body.characterId} @${body.likeness}` : ""}`,
+      `[images] generation ${generationId} submitted (${providerFor(body.model)} ${requestId}) · ${body.model} · ${body.aspectRatio} · x${body.numImages}${body.quality ? ` · ${body.quality}` : ""} · style=${body.styleId}${body.characterId ? ` · soul=${body.characterId} @${body.likeness}` : ""}`,
     );
     return NextResponse.json(
       { generationId, status: "IN_QUEUE", statusUrl: `/api/images/${generationId}`, finalPrompt },
       { status: 202, headers: { "Cache-Control": "no-store" } },
     );
   } catch (err) {
-    if (err instanceof FalNotConfiguredError) {
-      await markGenerationFailed(generationId, "FAL_KEY is not set.");
-      return errorResponse(500, "SERVER_MISCONFIGURED", "Image engine is not configured.");
-    }
-    if (err instanceof ValidationError) {
-      await markGenerationFailed(generationId, `Provider validation failed: ${JSON.stringify(err.fieldErrors)}`);
-      return errorResponse(422, "PROVIDER_VALIDATION_FAILED", "The image model rejected these settings.", err.fieldErrors);
-    }
-    if (err instanceof ApiError) {
-      console.error(`[images] Fal submit error ${err.status}:`, err.body);
-      await markGenerationFailed(generationId, `Fal submit error ${err.status}.`);
-      switch (err.status) {
-        case 401:
-        case 403:
-          return errorResponse(502, "PROVIDER_AUTH_FAILED", "Fal rejected the API key.");
-        case 402:
-          return errorResponse(402, "PROVIDER_PAYMENT_REQUIRED", "The Fal account has no credit. Top up at fal.ai and retry.");
-        case 429:
-          return errorResponse(429, "PROVIDER_RATE_LIMITED", "Too many generations at once. Try again shortly.");
-        default:
-          return errorResponse(502, "PROVIDER_ERROR", "The image model returned an error.");
-      }
-    }
-    console.error("[images] Unexpected submit error:", err);
-    await markGenerationFailed(generationId, err instanceof Error ? err.message : "Unexpected error.");
-    return errorResponse(500, "INTERNAL_ERROR", "Unexpected server error.");
+    const e = await handleSubmitError(err, generationId, "images");
+    return errorResponse(e.status, e.code, e.message, e.details);
   }
 }

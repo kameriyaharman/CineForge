@@ -1,7 +1,10 @@
 import { archiveGenerationImages } from "@/lib/assets";
 import { Prisma } from "@/lib/generated/prisma/client";
+import type { EditToolId } from "@/lib/edit-tools";
 import type { ImageAspectRatio, ImageModelId } from "@/lib/image-models";
 import { prisma } from "@/lib/prisma";
+import { getFal } from "@/lib/render-pipeline";
+import { createPrediction, encodeReplicateIds } from "@/lib/replicate";
 
 /**
  * Image Studio pipeline — server only.
@@ -12,8 +15,12 @@ import { prisma } from "@/lib/prisma";
 /** A generation still unfinished after this long is cancelled. */
 export const IMAGE_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** A text-to-image model or an edit tool — both run as an ImageGeneration. */
+export type JobModel = ImageModelId | EditToolId;
+export type Provider = "fal" | "replicate";
+
 export interface ImageRequest {
-  model: ImageModelId;
+  model: JobModel;
   prompt: string;
   aspectRatio: ImageAspectRatio;
   numImages: number;
@@ -21,6 +28,14 @@ export interface ImageRequest {
   seed: number | null;
   /** Soul ID LoRA (required for the Soul ID model). */
   lora?: { url: string; scale: number };
+  /** Edits: short-lived link to the source image. */
+  sourceUrl?: string;
+}
+
+const KLEIN_REPLICATE = "black-forest-labs/flux-2-klein-4b";
+
+export function providerFor(model: JobModel): Provider {
+  return model === "flux-2-klein" || model === "edit-klein" ? "replicate" : "fal";
 }
 
 type Size = { width: number; height: number };
@@ -65,8 +80,17 @@ const SOUL_SIZES: Record<"standard" | "hd", Record<ImageAspectRatio, Size>> = {
   },
 };
 
-export function falEndpointFor(model: ImageModelId): string {
+export function falEndpointFor(model: JobModel): string {
   switch (model) {
+    case "flux-2-klein":
+    case "edit-klein":
+      throw new Error(`${model} runs on Replicate, not Fal.`);
+    case "edit-nano":
+      return "fal-ai/nano-banana-pro/edit";
+    case "upscale":
+      return "fal-ai/seedvr/upscale/image";
+    case "remove-bg":
+      return "fal-ai/birefnet/v2";
     case "flux-2-flash":
       return "fal-ai/flux-2/flash";
     case "flux-pro-ultra":
@@ -84,6 +108,38 @@ export function falEndpointFor(model: ImageModelId): string {
 export function buildFalInput(req: ImageRequest): Record<string, unknown> {
   const seed = req.seed ?? undefined;
   switch (req.model) {
+    case "flux-2-klein":
+    case "edit-klein":
+      throw new Error(`${req.model} runs on Replicate.`);
+    case "edit-nano":
+      if (!req.sourceUrl) throw new Error("Edit needs a source image.");
+      return {
+        prompt: req.prompt,
+        image_urls: [req.sourceUrl],
+        aspect_ratio: "auto",
+        resolution: req.quality ?? "1K",
+        num_images: 1,
+        output_format: "png",
+        seed,
+      };
+    case "upscale":
+      if (!req.sourceUrl) throw new Error("Upscale needs a source image.");
+      return {
+        image_url: req.sourceUrl,
+        upscale_mode: "factor",
+        upscale_factor: req.quality === "4" ? 4 : 2,
+        output_format: "jpg",
+        seed,
+      };
+    case "remove-bg":
+      if (!req.sourceUrl) throw new Error("Background removal needs a source image.");
+      return {
+        image_url: req.sourceUrl,
+        model: req.quality === "portrait" ? "Portrait" : "General Use (Heavy)",
+        operating_resolution: "2048x2048",
+        output_format: "png",
+        refine_foreground: true,
+      };
     case "flux-2-flash":
       return {
         prompt: req.prompt,
@@ -138,6 +194,60 @@ export function buildFalInput(req: ImageRequest): Record<string, unknown> {
   }
 }
 
+/** One Replicate input per image (Klein makes one image per prediction). */
+export function buildReplicateInputs(req: ImageRequest): Record<string, unknown>[] {
+  const base: Record<string, unknown> =
+    req.model === "edit-klein"
+      ? {
+          prompt: req.prompt,
+          images: req.sourceUrl ? [req.sourceUrl] : [],
+          aspect_ratio: "match_input_image",
+          output_megapixels: req.quality ?? "1",
+          output_format: "jpg",
+          output_quality: 90,
+        }
+      : {
+          prompt: req.prompt,
+          aspect_ratio: req.aspectRatio,
+          output_megapixels: req.quality ?? "1",
+          output_format: "jpg",
+          output_quality: 90,
+        };
+  return Array.from({ length: Math.max(1, req.numImages) }, (_, i) => ({
+    ...base,
+    // Distinct seeds keep variations different; a fixed seed stays reproducible.
+    ...(req.seed !== null ? { seed: req.seed + i } : {}),
+  }));
+}
+
+/**
+ * Sends the job to its provider and returns the id stored as
+ * ImageGeneration.providerRequestId (Fal request id, or "rep:id1,id2").
+ */
+export async function submitToProvider(req: ImageRequest): Promise<string> {
+  if (providerFor(req.model) === "replicate") {
+    const ids: string[] = [];
+    for (const input of buildReplicateInputs(req)) {
+      const prediction = await createPrediction(KLEIN_REPLICATE, input);
+      ids.push(prediction.id);
+    }
+    return encodeReplicateIds(ids);
+  }
+  const { request_id } = await getFal().queue.submit(falEndpointFor(req.model), { input: buildFalInput(req) });
+  return request_id;
+}
+
+/** Turns Replicate output URLs into GeneratedImage records. */
+export function replicateImages(urls: string[]): GeneratedImage[] {
+  return urls
+    .filter((u) => u.startsWith("https://"))
+    .map((url) => {
+      const ext = url.split("?")[0]!.split(".").pop()?.toLowerCase();
+      const contentType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+      return { url, width: null, height: null, contentType };
+    });
+}
+
 export interface GeneratedImage {
   url: string;
   width: number | null;
@@ -149,7 +259,8 @@ export interface GeneratedImage {
 export function parseImageOutput(data: unknown): { images: GeneratedImage[]; seed: number | null } {
   if (typeof data !== "object" || data === null) return { images: [], seed: null };
   const record = data as Record<string, unknown>;
-  const list = Array.isArray(record.images) ? record.images : [];
+  // Most models return `images: [...]`; upscale / background removal return `image`.
+  const list = Array.isArray(record.images) ? record.images : record.image ? [record.image] : [];
   const nsfw = Array.isArray(record.has_nsfw_concepts) ? record.has_nsfw_concepts : [];
   const images: GeneratedImage[] = [];
   list.forEach((item, index) => {
