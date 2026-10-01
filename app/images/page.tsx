@@ -22,6 +22,7 @@ import {
   RotateCcw,
   Sparkles,
   Square,
+  Clapperboard,
   Wand2,
   X,
 } from "lucide-react";
@@ -862,12 +863,12 @@ export default function ImageStudioPage() {
                       </a>
                       {img.assetId && (
                         <Link
-                          href={`/edit?asset=${img.assetId}`}
-                          className="pointer-events-auto flex size-9 items-center justify-center rounded-lg border border-white/15 bg-black/60 text-slate-200 backdrop-blur hover:border-indigo-400/60"
-                          title="Edit, upscale or remove background"
+                          href={`/video?asset=${img.assetId}`}
+                          className="pointer-events-auto flex h-9 items-center gap-1.5 rounded-lg border border-indigo-400/50 bg-indigo-600/70 px-2.5 text-xs font-medium text-white backdrop-blur hover:bg-indigo-500"
+                          title="Make a video from this image"
                         >
-                          <Wand2 className="size-4" aria-hidden />
-                          <span className="sr-only">Edit</span>
+                          <Clapperboard className="size-4" aria-hidden />
+                          Animate
                         </Link>
                       )}
                     </div>

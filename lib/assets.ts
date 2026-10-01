@@ -23,7 +23,7 @@ export async function archiveClipVideo(
   role: ClipRole,
   sourceUrl: string,
   /** Values that differ from the clip's render settings, e.g. the upscale resolution. */
-  metaOverrides: Record<string, string | number> = {},
+  metaOverrides: Record<string, string | number | boolean | null> = {},
 ): Promise<void> {
   if (!isStorageConfigured()) {
     console.warn("[assets] DEV NOTICE: S3_* storage variables not set — keeping provider links only.");

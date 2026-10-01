@@ -3,14 +3,13 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import { Aperture, Clapperboard, Fingerprint, FolderOpen, ImageIcon, Wand2 } from "lucide-react";
+import { Aperture, Clapperboard, Fingerprint, FolderOpen, ImageIcon } from "lucide-react";
 import { AccountControl, TestModeBanner } from "@/components/account-control";
 
 const NAV = [
   { href: "/soul-id", label: "Soul ID", icon: Fingerprint },
   { href: "/images", label: "Images", icon: ImageIcon },
-  { href: "/edit", label: "Edit", icon: Wand2 },
-  { href: "/", label: "Video", icon: Clapperboard },
+  { href: "/video", label: "Video", icon: Clapperboard },
   { href: "/library", label: "Library", icon: FolderOpen },
 ] as const;
 
@@ -32,7 +31,8 @@ export function AppHeader({ status }: { status?: ReactNode }) {
           </Link>
           <nav aria-label="Main" className="flex items-center gap-1">
             {NAV.map(({ href, label, icon: Icon }) => {
-              const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
+              const active =
+                href === "/video" ? pathname === "/" || pathname.startsWith("/video") : pathname.startsWith(href);
               return (
                 <Link
                   key={href}

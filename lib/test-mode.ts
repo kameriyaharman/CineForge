@@ -158,7 +158,11 @@ export function sampleVideoPath(aspectRatio: string | null): string {
 }
 
 /** Copies the bundled sample clip into the bucket as the clip's render. */
-export async function archiveTestClip(clipId: string, publicPath: string): Promise<void> {
+export async function archiveTestClip(
+  clipId: string,
+  publicPath: string,
+  extraMeta: Record<string, string | number | boolean | null> = {},
+): Promise<void> {
   if (!isStorageConfigured()) return;
   try {
     const clip = await prisma.videoClip.findUnique({
@@ -195,6 +199,7 @@ export async function archiveTestClip(clipId: string, publicPath: string): Promi
           numFrames: clip.numFrames,
           aspectRatio: clip.aspectRatio,
           characterName: clip.character?.characterName ?? null,
+          ...extraMeta,
         } satisfies Prisma.InputJsonObject,
       },
     });

@@ -12,7 +12,7 @@ import {
   Play,
   Sparkles,
   Trash2,
-  Wand2,
+  Clapperboard,
   X,
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
@@ -122,7 +122,9 @@ function badgesFor(asset: LibraryAsset): string[] {
   if (asset.role === "UPSCALE") badges.push("Upscaled");
   const res = metaString(asset.meta, "resolution");
   if (res) badges.push(/k$/i.test(res) ? res.toUpperCase() : res);
-  const dur = durationFromFrames(metaNumber(asset.meta, "numFrames"));
+  const secs = metaNumber(asset.meta, "durationSec");
+  const dur = secs ? `${secs}s` : durationFromFrames(metaNumber(asset.meta, "numFrames"));
+  if (asset.meta?.withAudio === true) badges.push("Sound");
   if (dur) badges.push(dur);
   const model = metaString(asset.meta, "modelLabel");
   if (model) badges.push(model);
@@ -454,12 +456,12 @@ function AssetCard({
           <div className="flex shrink-0 gap-1">
             {asset.kind === "IMAGE" && (
               <Link
-                href={`/edit?asset=${asset.id}`}
-                aria-label="Edit"
-                title="Edit, upscale or remove background"
+                href={`/video?asset=${asset.id}`}
+                aria-label="Animate"
+                title="Make a video from this image"
                 className="flex size-8 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-100"
               >
-                <Wand2 className="size-4" aria-hidden />
+                <Clapperboard className="size-4" aria-hidden />
               </Link>
             )}
             <a

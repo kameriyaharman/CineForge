@@ -9,7 +9,7 @@ import {
   recordSpend,
 } from "@/lib/billing";
 import { EDIT_PROMPT_MAX, getEditTool, type EditToolId } from "@/lib/edit-tools";
-import { IMAGE_ASPECT_OPTIONS } from "@/lib/image-models";
+import { metaNum, nearestAspect } from "@/lib/aspect";
 import { markGenerationFailed, providerFor, submitToProvider } from "@/lib/image-pipeline";
 import { IMAGE_UPLOAD_TYPES } from "@/lib/image-sniff";
 import { handleSubmitError } from "@/lib/job-errors";
@@ -28,29 +28,6 @@ import { presignGet } from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/** Nearest of our aspect ratios, for display and Test Mode samples. */
-function nearestAspect(width: number | null, height: number | null, fallback: unknown): string {
-  if (typeof fallback === "string" && IMAGE_ASPECT_OPTIONS.some((o) => o.value === fallback)) return fallback;
-  if (!width || !height) return "1:1";
-  const r = width / height;
-  let best = "1:1";
-  let diff = Infinity;
-  for (const o of IMAGE_ASPECT_OPTIONS) {
-    const [w, h] = o.value.split(":").map(Number);
-    const d = Math.abs(Math.log(r / (w! / h!)));
-    if (d < diff) {
-      diff = d;
-      best = o.value;
-    }
-  }
-  return best;
-}
-
-function num(meta: unknown, key: string): number | null {
-  const v = (meta as Record<string, unknown> | null)?.[key];
-  return typeof v === "number" ? v : null;
-}
 
 export async function POST(req: NextRequest) {
   const session = verifySession(req);
@@ -112,11 +89,12 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const aspectRatio = nearestAspect(
-    num(source.meta, "width"),
-    num(source.meta, "height"),
-    (source.meta as Record<string, unknown> | null)?.aspectRatio,
-  );
+  const aspectRatio =
+    nearestAspect(
+      metaNum(source.meta, "width"),
+      metaNum(source.meta, "height"),
+      (source.meta as Record<string, unknown> | null)?.aspectRatio,
+    ) ?? "1:1";
   const label = tool.needsPrompt ? prompt : `${tool.label} · ${tool.options.find((o) => o.value === option)?.label}`;
 
   let generationId: string;

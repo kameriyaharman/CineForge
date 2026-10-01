@@ -139,6 +139,12 @@ model VideoClip {
   resolution        String?    @db.VarChar(10)
   numFrames         Int?       @map("num_frames")
   aspectRatio       String?    @map("aspect_ratio") @db.VarChar(10)
+  /// Video Studio model id (lib/video-models.ts); null = Hunyuan text-to-video.
+  model             String?    @map("model") @db.VarChar(40)
+  /// Image-to-video: the Library image that was animated.
+  sourceAssetId     String?    @map("source_asset_id") @db.Uuid
+  durationSec       Float?     @map("duration_sec")
+  withAudio         Boolean?   @map("with_audio")
   rawVideoUrl       String?    @map("raw_video_url") @db.Text
   upscaledVideoUrl  String?    @map("upscaled_video_url") @db.Text
   status            ClipStatus @default(PENDING)
